@@ -1,0 +1,20 @@
+[project]
+name = "itg-oop"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "imiderji", email = "skishou.developer@yandex.ru" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

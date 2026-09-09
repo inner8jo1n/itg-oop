@@ -9,3 +9,17 @@ venv/
 .ruff_cache/
 
 *.egg-info/
+dist/
+build/
+
+.coverage
+.coverage.*
+htmlcov/
+
+.env
+.env.*
+
+.DS_Store
+
+.idea/
+.vscode/
