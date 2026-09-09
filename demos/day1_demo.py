@@ -10,10 +10,21 @@ from bank.exceptions import (
 
 
 def section(title: str) -> None:
+    """
+    Print a titled section separator to the console.
+
+    :param title: section title to display
+    :return: None
+    """
     print(f"\n--- {title} ---")
 
 
 def main() -> None:
+    """
+    Run the day 1 demo scenarios for BankAccount.
+
+    :return: None
+    """
     section("Создание счетов")
     active_account = BankAccount(
         owner="Иван Петров", currency=Currency.RUB, initial_balance=Decimal("1000")

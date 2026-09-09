@@ -7,6 +7,10 @@ from bank.exceptions import InsufficientFundsError, InvalidOperationError
 
 
 class BankAccount(AbstractAccount):
+    """
+    Concrete bank account with amount validation and currency support.
+    """
+
     def __init__(
         self,
         owner: str,
@@ -14,6 +18,14 @@ class BankAccount(AbstractAccount):
         account_id: str | None = None,
         initial_balance: Decimal = Decimal("0"),
     ):
+        """
+        Create a new bank account, validating owner, currency and balance.
+
+        :param owner: name of the account owner
+        :param currency: currency of the account
+        :param account_id: account identifier, auto-generated if not given
+        :param initial_balance: starting balance of the account
+        """
         if not owner or not str(owner).strip():
             raise InvalidOperationError("Owner name must not be empty")
         if not isinstance(currency, Currency):
@@ -29,14 +41,31 @@ class BankAccount(AbstractAccount):
 
     @staticmethod
     def _generate_account_id() -> str:
+        """
+        Generate a short unique account identifier.
+
+        :return: generated account identifier
+        """
         return uuid.uuid4().hex[:12].upper()
 
     @property
     def currency(self) -> Currency:
+        """
+        Get the account's currency.
+
+        :return: account currency
+        """
         return self._currency
 
     @staticmethod
     def _validate_amount(amount, allow_zero: bool = False) -> Decimal:
+        """
+        Validate and convert an amount to a positive Decimal.
+
+        :param amount: value to validate
+        :param allow_zero: whether a zero amount is allowed
+        :return: validated amount as Decimal
+        """
         try:
             validated = Decimal(str(amount))
         except (InvalidOperation, TypeError, ValueError) as err:
@@ -50,10 +79,23 @@ class BankAccount(AbstractAccount):
         return validated
 
     def deposit(self, amount) -> None:
+        """
+        Add funds to the account after validating the amount and status.
+
+        :param amount: amount to deposit
+        :return: None
+        """
         self._ensure_operable()
         self._balance += self._validate_amount(amount)
 
     def withdraw(self, amount) -> None:
+        """
+        Remove funds from the account after validating the amount,
+        status and available balance.
+
+        :param amount: amount to withdraw
+        :return: None
+        """
         self._ensure_operable()
         validated = self._validate_amount(amount)
         if validated > self._balance:
@@ -64,6 +106,11 @@ class BankAccount(AbstractAccount):
         self._balance -= validated
 
     def get_account_info(self) -> dict:
+        """
+        Get a summary of the account's data.
+
+        :return: dictionary with account id, owner, status, balance and currency
+        """
         return {
             "account_id": self._account_id,
             "owner": self._owner,
@@ -73,6 +120,11 @@ class BankAccount(AbstractAccount):
         }
 
     def __str__(self) -> str:
+        """
+        Build a human-readable representation of the account.
+
+        :return: string with account type, owner, masked id, status and balance
+        """
         last4 = self._account_id[-4:]
         return (
             f"{self.__class__.__name__} | Client: {self._owner} | "
