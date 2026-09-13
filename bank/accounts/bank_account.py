@@ -1,5 +1,6 @@
 import uuid
 from decimal import Decimal, InvalidOperation
+from typing import override
 
 from bank.accounts.abstract_account import AbstractAccount
 from bank.enums import Currency
@@ -87,6 +88,7 @@ class BankAccount(AbstractAccount):
             )
         return validated
 
+    @override
     def deposit(self, amount) -> None:
         """
         Add funds to the account after validating the amount and status.
@@ -97,6 +99,7 @@ class BankAccount(AbstractAccount):
         self._ensure_operable()
         self._balance += self._validate_amount(amount)
 
+    @override
     def withdraw(self, amount) -> None:
         """
         Remove funds from the account after validating the amount,
@@ -114,6 +117,7 @@ class BankAccount(AbstractAccount):
             )
         self._balance -= validated
 
+    @override
     def get_account_info(self) -> dict:
         """
         Get a summary of the account's data.
@@ -129,6 +133,7 @@ class BankAccount(AbstractAccount):
             "currency": self._currency.value,
         }
 
+    @override
     def __str__(self) -> str:
         """
         Build a human-readable representation of the account.
