@@ -31,3 +31,12 @@ class AssetType(StrEnum):
     STOCKS = "stocks"
     BONDS = "bonds"
     ETF = "etf"
+
+
+class ClientStatus(StrEnum):
+    """
+    Possible states of a bank client's authentication access.
+    """
+
+    ACTIVE = "active"
+    BLOCKED = "blocked"

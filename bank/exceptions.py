@@ -36,3 +36,43 @@ class InsufficientFundsError(BankError):
     """
 
     pass
+
+
+class ClientNotFoundError(BankError):
+    """
+    Raised when no client is found for the given id.
+    """
+
+    pass
+
+
+class AccountNotFoundError(BankError):
+    """
+    Raised when no account is found for the given id.
+    """
+
+    pass
+
+
+class ClientBlockedError(BankError):
+    """
+    Raised when an operation is attempted for a blocked client.
+    """
+
+    pass
+
+
+class AuthenticationError(BankError):
+    """
+    Raised when authentication credentials are invalid.
+    """
+
+    pass
+
+
+class OperationNotAllowedError(BankError):
+    """
+    Raised when an operation is attempted outside allowed hours.
+    """
+
+    pass
