@@ -34,7 +34,9 @@ class BankAccount(AbstractAccount):
         normalized_owner = str(owner).strip()
         normalized_account_id = str(account_id).strip() if account_id else ""
 
-        validated_balance = self._validate_amount(initial_balance, allow_zero=True)
+        validated_balance = self._validate_amount(
+            initial_balance, allow_zero=True
+        )
         super().__init__(
             account_id=normalized_account_id or self._generate_account_id(),
             owner=normalized_owner,
@@ -76,7 +78,9 @@ class BankAccount(AbstractAccount):
                 f"Amount must be a number, got {amount!r}"
             ) from err
         if validated.is_nan() or validated.is_infinite():
-            raise InvalidOperationError(f"Amount must be finite, got {amount!r}")
+            raise InvalidOperationError(
+                f"Amount must be finite, got {amount!r}"
+            )
         if validated < 0 or (validated == 0 and not allow_zero):
             raise InvalidOperationError(
                 f"Amount must be positive, got {validated}"
@@ -114,7 +118,8 @@ class BankAccount(AbstractAccount):
         """
         Get a summary of the account's data.
 
-        :return: dictionary with account id, owner, status, balance and currency
+        :return: dictionary with account id, owner, status, balance
+            and currency
         """
         return {
             "account_id": self._account_id,

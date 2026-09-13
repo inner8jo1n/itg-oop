@@ -190,7 +190,9 @@ class TestValidateAmount:
 
 
 class TestAccountInfo:
-    def test_get_account_info_contains_expected_fields(self, account: BankAccount):
+    def test_get_account_info_contains_expected_fields(
+        self, account: BankAccount
+    ):
         info = account.get_account_info()
         assert info == {
             "account_id": account.account_id,

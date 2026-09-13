@@ -27,7 +27,9 @@ def main() -> None:
     """
     section("Создание счетов")
     active_account = BankAccount(
-        owner="Иван Петров", currency=Currency.RUB, initial_balance=Decimal("1000")
+        owner="Иван Петров",
+        currency=Currency.RUB,
+        initial_balance=Decimal("1000"),
     )
     frozen_account = BankAccount(
         owner="Мария Смирнова",
