@@ -197,9 +197,19 @@ class Bank:
             initial_balance=initial_balance,
             **extra_kwargs,
         )
+        if account.account_id in self._accounts:
+            raise InvalidOperationError(
+                f"Account id {account.account_id} is already in use"
+            )
         self._accounts[account.account_id] = account
         self._account_owners[account.account_id] = client.client_id
         client.add_account_id(account.account_id)
+        account._bind_bank_hooks(
+            before_operation=lambda: self._ensure_operating_hours(client),
+            after_withdraw=lambda withdrawn: self._flag_if_large_withdrawal(
+                account, withdrawn
+            ),
+        )
         return account
 
     def close_account(self, account_id: str) -> None:
@@ -210,7 +220,6 @@ class Bank:
         :return: None
         """
         account = self._get_account(account_id)
-        self._ensure_operating_hours(self._get_client_for_account(account_id))
         account.close()
 
     def freeze_account(self, account_id: str) -> None:
@@ -221,7 +230,6 @@ class Bank:
         :return: None
         """
         account = self._get_account(account_id)
-        self._ensure_operating_hours(self._get_client_for_account(account_id))
         account.freeze()
 
     def unfreeze_account(self, account_id: str) -> None:
@@ -232,7 +240,6 @@ class Bank:
         :return: None
         """
         account = self._get_account(account_id)
-        self._ensure_operating_hours(self._get_client_for_account(account_id))
         account.unfreeze()
 
     def authenticate_client(self, client_id: str, password: str) -> bool:
@@ -269,17 +276,29 @@ class Bank:
         :return: None
         """
         account = self._get_account(account_id)
-        client = self._get_client_for_account(account_id)
-        self._ensure_operating_hours(client)
-        balance_before = account.balance
         account.withdraw(amount)
-        withdrawn = balance_before - account.balance
-        if (
-            client is not None
-            and withdrawn > self._suspicious_withdrawal_threshold
-        ):
+
+    def _flag_if_large_withdrawal(
+        self, account: BankAccount, withdrawn: Decimal
+    ) -> None:
+        """
+        Flag the account's owning client as suspicious if the given
+        withdrawn amount exceeds the configured threshold. Called by
+        every account this bank has opened after a successful
+        withdrawal, regardless of whether it went through
+        :meth:`withdraw_from_account` or was invoked directly.
+
+        :param account: account the withdrawal was made from
+        :param withdrawn: actual amount debited from the balance
+        :return: None
+        """
+        if withdrawn <= self._suspicious_withdrawal_threshold:
+            return
+        client = self._get_client_for_account(account.account_id)
+        if client is not None:
             client.flag_suspicious(
-                f"Large withdrawal of {withdrawn} from account {account_id}"
+                f"Large withdrawal of {withdrawn} from account "
+                f"{account.account_id}"
             )
 
     def search_accounts(

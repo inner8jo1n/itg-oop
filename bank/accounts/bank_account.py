@@ -116,6 +116,7 @@ class BankAccount(AbstractAccount):
                 f"balance {self._balance}, requested {validated}"
             )
         self._balance -= validated
+        self._notify_withdrawal(validated)
 
     @override
     def get_account_info(self) -> dict:

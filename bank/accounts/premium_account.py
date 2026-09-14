@@ -102,6 +102,7 @@ class PremiumAccount(BankAccount):
                 f"{self._overdraft_limit}"
             )
         self._balance -= total_debit
+        self._notify_withdrawal(total_debit)
 
     @override
     def get_account_info(self) -> dict:

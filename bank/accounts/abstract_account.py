@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from decimal import Decimal
 
 from bank.enums import AccountStatus
@@ -22,6 +23,8 @@ class AbstractAccount(ABC):
         self._owner = owner
         self._balance = initial_balance
         self._status = AccountStatus.ACTIVE
+        self._before_operation: Callable[[], None] | None = None
+        self._after_withdraw: Callable[[Decimal], None] | None = None
 
     @property
     def account_id(self) -> str:
@@ -59,16 +62,48 @@ class AbstractAccount(ABC):
         """
         return self._status
 
+    def _bind_bank_hooks(
+        self,
+        before_operation: Callable[[], None],
+        after_withdraw: Callable[[Decimal], None],
+    ) -> None:
+        """
+        Attach the bank-level checks that every mutating operation on
+        this account must pass, regardless of whether it is invoked
+        through the bank or directly on the account.
+
+        :param before_operation: called before each operation; raises
+            if the operation is not currently allowed
+        :param after_withdraw: called with the amount debited after
+            each successful withdrawal, to flag suspicious activity
+        :return: None
+        """
+        self._before_operation = before_operation
+        self._after_withdraw = after_withdraw
+
     def _ensure_operable(self) -> None:
         """
-        Check that the account is neither frozen nor closed.
+        Check that the operation is currently allowed and that the
+        account is neither frozen nor closed.
 
         :return: None
         """
+        if self._before_operation is not None:
+            self._before_operation()
         if self._status == AccountStatus.FROZEN:
             raise AccountFrozenError(f"Account {self._account_id} is frozen")
         if self._status == AccountStatus.CLOSED:
             raise AccountClosedError(f"Account {self._account_id} is closed")
+
+    def _notify_withdrawal(self, withdrawn: Decimal) -> None:
+        """
+        Report a completed withdrawal to the bound bank hook, if any.
+
+        :param withdrawn: actual amount debited from the balance
+        :return: None
+        """
+        if self._after_withdraw is not None:
+            self._after_withdraw(withdrawn)
 
     def freeze(self) -> None:
         """
@@ -76,6 +111,8 @@ class AbstractAccount(ABC):
 
         :return: None
         """
+        if self._before_operation is not None:
+            self._before_operation()
         if self._status == AccountStatus.CLOSED:
             raise AccountClosedError(f"Account {self._account_id} is closed")
         self._status = AccountStatus.FROZEN
@@ -86,6 +123,8 @@ class AbstractAccount(ABC):
 
         :return: None
         """
+        if self._before_operation is not None:
+            self._before_operation()
         if self._status == AccountStatus.CLOSED:
             raise AccountClosedError(f"Account {self._account_id} is closed")
         self._status = AccountStatus.ACTIVE
@@ -96,6 +135,8 @@ class AbstractAccount(ABC):
 
         :return: None
         """
+        if self._before_operation is not None:
+            self._before_operation()
         self._status = AccountStatus.CLOSED
 
     @abstractmethod

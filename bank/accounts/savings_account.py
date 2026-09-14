@@ -88,6 +88,7 @@ class SavingsAccount(BankAccount):
                 f"{self._balance}, requested {validated}"
             )
         self._balance -= validated
+        self._notify_withdrawal(validated)
 
     def apply_monthly_interest(self) -> Decimal:
         """

@@ -96,6 +96,7 @@ class InvestmentAccount(BankAccount):
                 f"funds are invested and not directly withdrawable)"
             )
         self._balance -= validated
+        self._notify_withdrawal(validated)
 
     def project_yearly_growth(self, growth_rates: dict) -> Decimal:
         """
