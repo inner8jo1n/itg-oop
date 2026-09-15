@@ -40,3 +40,27 @@ class ClientStatus(StrEnum):
 
     ACTIVE = "active"
     BLOCKED = "blocked"
+
+
+class TransactionType(StrEnum):
+    """
+    Kinds of operations a Transaction can represent.
+    """
+
+    DEPOSIT = "deposit"
+    WITHDRAWAL = "withdrawal"
+    TRANSFER = "transfer"
+    EXTERNAL_TRANSFER = "external_transfer"
+
+
+class TransactionStatus(StrEnum):
+    """
+    Lifecycle states of a Transaction.
+    """
+
+    PENDING = "pending"
+    SCHEDULED = "scheduled"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"

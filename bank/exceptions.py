@@ -76,3 +76,20 @@ class OperationNotAllowedError(BankError):
     """
 
     pass
+
+
+class TransactionNotFoundError(BankError):
+    """
+    Raised when no transaction is found for the given id.
+    """
+
+    pass
+
+
+class ExchangeRateNotFoundError(BankError):
+    """
+    Raised when no exchange rate is available for a currency pair
+    required by a currency conversion.
+    """
+
+    pass

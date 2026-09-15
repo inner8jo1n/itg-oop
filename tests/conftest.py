@@ -57,6 +57,24 @@ def investment_account() -> InvestmentAccount:
 
 
 @pytest.fixture
+def other_account() -> BankAccount:
+    return BankAccount(
+        owner="Petr Petrov",
+        currency=Currency.RUB,
+        initial_balance=Decimal("500"),
+    )
+
+
+@pytest.fixture
+def usd_account() -> BankAccount:
+    return BankAccount(
+        owner="Ivan Ivanov",
+        currency=Currency.USD,
+        initial_balance=Decimal("100"),
+    )
+
+
+@pytest.fixture
 def adult_birth_date() -> date:
     today = date.today()
     return today.replace(year=today.year - 25)
