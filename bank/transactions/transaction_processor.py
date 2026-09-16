@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from bank.accounts.bank_account import BankAccount
-from bank.enums import Currency, TransactionType
+from bank.enums import Currency, TransactionStatus, TransactionType
 from bank.exceptions import (
     BankError,
     ExchangeRateNotFoundError,
@@ -120,22 +120,32 @@ class TransactionProcessor:
 
     def _execute_withdrawal(self, transaction: Transaction) -> None:
         """
-        Debit the sender by the transaction amount. No fee applies.
+        Debit the sender by the transaction amount. This processor
+        charges no fee of its own for a withdrawal, but the recorded
+        fee reflects whatever the account actually debited beyond
+        the requested amount (e.g. PremiumAccount's own fixed
+        transaction fee), measured from the actual balance change
+        rather than assumed to be zero.
 
         :param transaction: WITHDRAWAL transaction to execute
         :return: None
         """
-        transaction.sender.withdraw(transaction.amount)
-        transaction._set_fee(Decimal("0"))
+        sender = transaction.sender
+        balance_before = sender.balance
+        sender.withdraw(transaction.amount)
+        actual_debited = balance_before - sender.balance
+        transaction._set_fee(actual_debited - transaction.amount)
 
     def _execute_transfer(self, transaction: Transaction) -> None:
         """
-        Move funds between sender and receiver with no fee.
+        Move funds between sender and receiver. This processor
+        charges no fee of its own for an internal transfer, though
+        the sender's account may still charge one (see _move_funds).
 
         :param transaction: TRANSFER transaction to execute
         :return: None
         """
-        self._move_funds(transaction, fee=Decimal("0"))
+        self._move_funds(transaction, processor_fee=Decimal("0"))
 
     def _execute_external_transfer(self, transaction: Transaction) -> None:
         """
@@ -145,30 +155,33 @@ class TransactionProcessor:
         :param transaction: EXTERNAL_TRANSFER transaction to execute
         :return: None
         """
-        fee = transaction.amount * self._external_transfer_fee_rate
-        self._move_funds(transaction, fee=fee)
+        processor_fee = transaction.amount * self._external_transfer_fee_rate
+        self._move_funds(transaction, processor_fee=processor_fee)
 
-    def _move_funds(self, transaction: Transaction, fee: Decimal) -> None:
+    def _move_funds(
+        self, transaction: Transaction, processor_fee: Decimal
+    ) -> None:
         """
-        Debit the sender for the amount plus fee (both in the
-        transaction's currency) and credit the receiver with the
-        amount converted into the receiver's currency. The fee is
-        retained by the bank rather than transferred. If the
+        Debit the sender for the amount plus this processor's own
+        fee (both in the transaction's currency) and credit the
+        receiver with the amount converted into the receiver's
+        currency. The fee recorded on `transaction` is measured from
+        the sender's actual balance change rather than assumed to
+        equal `processor_fee`, since some account types (e.g.
+        PremiumAccount) silently deduct an additional fee of their
+        own on top of what withdraw() was asked for. If the
         receiver's deposit fails after the sender was already
         debited, the debit is refunded so no funds are destroyed.
-        The refund uses the sender's actual balance change rather
-        than assuming it equals `debit_amount`, since some account
-        types (e.g. PremiumAccount) deduct extra fees of their own
-        on top of what withdraw() was asked for.
 
         :param transaction: transaction being executed
-        :param fee: fee to add to the sender's debit, in the
-            transaction's currency
+        :param processor_fee: fee this processor adds to the
+            sender's debit, in the transaction's currency; the
+            account itself may add more on top
         :return: None
         """
         sender = transaction.sender
         receiver = transaction.receiver
-        debit_amount = transaction.amount + fee
+        debit_amount = transaction.amount + processor_fee
         credited = self.convert(
             transaction.amount, transaction.currency, receiver.currency
         )
@@ -181,7 +194,7 @@ class TransactionProcessor:
             self._refund_or_raise(
                 transaction, sender, actual_debited, deposit_error
             )
-        transaction._set_fee(fee)
+        transaction._set_fee(actual_debited - transaction.amount)
 
     @staticmethod
     def _refund_or_raise(
@@ -229,13 +242,23 @@ class TransactionProcessor:
         Process a single transaction, retrying on transient errors
         up to the configured limit before marking it failed.
 
-        :param transaction: transaction to process; must be PENDING
-            or SCHEDULED
+        :param transaction: transaction to process; must be PENDING,
+            or SCHEDULED with `scheduled_at` already due
         :return: None
         """
         if not isinstance(transaction, Transaction):
             raise InvalidOperationError(
                 f"Expected a Transaction, got {transaction!r}"
+            )
+        if (
+            transaction.status == TransactionStatus.SCHEDULED
+            and transaction.scheduled_at is not None
+            and transaction.scheduled_at > self._clock()
+        ):
+            raise InvalidOperationError(
+                f"Transaction {transaction.transaction_id} is "
+                f"scheduled for {transaction.scheduled_at}, which "
+                f"has not yet arrived"
             )
         transaction.mark_processing()
         last_error: Exception | None = None

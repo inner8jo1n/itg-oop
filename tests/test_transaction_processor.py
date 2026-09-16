@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -120,6 +121,43 @@ class TestProcessRejectsNonTransaction:
             processor.process(tx)
         assert tx.status.value == "completed"
 
+    def test_rejects_scheduled_transaction_processed_early(
+        self, account: BankAccount
+    ):
+        # process() must not execute a SCHEDULED transaction ahead
+        # of its scheduled_at, even when called directly instead of
+        # via TransactionQueue.pop_next() (which normally gates on
+        # readiness before a transaction ever reaches process()).
+        now = datetime(2024, 1, 1, 12, 0, 0)
+        tx = Transaction(
+            type=TransactionType.DEPOSIT,
+            amount=Decimal("10"),
+            receiver=account,
+            scheduled_at=now + timedelta(hours=1),
+            created_at=now,
+        )
+        processor = TransactionProcessor(clock=lambda: now)
+        with pytest.raises(InvalidOperationError):
+            processor.process(tx)
+        assert tx.status.value == "scheduled"
+        assert account.balance == Decimal("100")
+
+    def test_processes_scheduled_transaction_once_due(
+        self, account: BankAccount
+    ):
+        now = datetime(2024, 1, 1, 12, 0, 0)
+        tx = Transaction(
+            type=TransactionType.DEPOSIT,
+            amount=Decimal("10"),
+            receiver=account,
+            scheduled_at=now,
+            created_at=now,
+        )
+        processor = TransactionProcessor(clock=lambda: now)
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        assert account.balance == Decimal("110")
+
 
 class TestDeposit:
     def test_credits_receiver(self, account: BankAccount):
@@ -156,6 +194,24 @@ class TestWithdrawal:
         TransactionProcessor().process(tx)
         assert tx.status.value == "completed"
         assert account.balance == Decimal("70")
+        assert tx.fee == Decimal("0")
+
+    def test_records_account_fee_for_premium_sender(
+        self, premium_account: PremiumAccount
+    ):
+        # premium_account fixture charges a fixed transaction_fee of
+        # 10 on every withdrawal; this processor has no withdrawal
+        # fee of its own, but tx.fee must still reflect the 10 that
+        # was actually debited on top of the requested amount.
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("30"),
+            sender=premium_account,
+        )
+        TransactionProcessor().process(tx)
+        assert tx.status.value == "completed"
+        assert premium_account.balance == Decimal("960")
+        assert tx.fee == Decimal("10")
 
     def test_fails_on_insufficient_funds(self, account: BankAccount):
         tx = Transaction(
@@ -264,6 +320,10 @@ class TestTransfer:
         # premium_account fixture also charges a fixed transaction_fee
         # of 10 on top of the withdrawn amount: 1000 - 1200 - 10 = -210
         assert premium_account.balance == Decimal("-210")
+        # tx.fee reflects the actual total debited beyond the
+        # principal (1210 - 1200), i.e. the account's own fee, since
+        # this processor charges nothing extra for internal transfers
+        assert tx.fee == Decimal("10")
 
 
 class TestExternalTransfer:
@@ -307,8 +367,10 @@ class TestExternalTransfer:
         # transaction_fee=10 (its own fixed per-withdrawal fee).
         # Processor fee here is 40 * 0.1 = 4. PremiumAccount.withdraw
         # adds its own 10 on top of what it's asked to withdraw
-        # (40 + 4 = 44), so the account is actually debited 54, even
-        # though transaction.fee only records the processor's cut.
+        # (40 + 4 = 44), so the account is actually debited 54.
+        # tx.fee reflects that full 14 (4 processor + 10 account),
+        # not just the processor's own cut, so the transaction's own
+        # data stays truthful about what was actually charged.
         processor = TransactionProcessor(
             external_transfer_fee_rate=Decimal("0.1")
         )
@@ -320,7 +382,7 @@ class TestExternalTransfer:
         )
         processor.process(tx)
         assert tx.status.value == "completed"
-        assert tx.fee == Decimal("4.0")
+        assert tx.fee == Decimal("14.0")
         assert premium_account.balance == Decimal("946")
         assert other_account.balance == Decimal("540")
 
