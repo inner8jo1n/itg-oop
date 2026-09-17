@@ -301,6 +301,41 @@ class TestWithdrawFromAccount:
         assert client.is_suspicious is True
 
 
+class TestBankHasNoRiskOrAuditIntegration:
+    """
+    Bank.withdraw_from_account only ever flags the owning client
+    after the fact (see TestWithdrawFromAccount above) - it never
+    consults a RiskAnalyzer and can never block a dangerous operation
+    the way a risk-aware TransactionProcessor can. Bank's constructor
+    has no parameter to plug a RiskAnalyzer or AuditLog in at all, so
+    there is currently no way to make the Bank facade itself enforce
+    "block dangerous operations" - only a caller who separately
+    builds their own risk-aware TransactionProcessor gets that.
+    """
+
+    def test_constructor_accepts_no_risk_analyzer_parameter(self):
+        with pytest.raises(TypeError):
+            Bank(name="X", risk_analyzer=object())
+
+    def test_constructor_accepts_no_audit_log_parameter(self):
+        with pytest.raises(TypeError):
+            Bank(name="X", audit_log=object())
+
+    def test_arbitrarily_large_withdrawal_is_never_blocked(
+        self, bank: Bank, client: Client
+    ):
+        # However large, this only ever flags the client after the
+        # money has already moved - it is never refused for being
+        # risky, unlike TransactionProcessor with a RiskAnalyzer
+        # configured (see TestRiskAnalyzerIntegration).
+        account = bank.open_account(
+            client.client_id, initial_balance=Decimal("100000000")
+        )
+        bank.withdraw_from_account(account.account_id, Decimal("99000000"))
+        assert account.balance == Decimal("1000000")
+        assert client.is_suspicious is True
+
+
 class TestSearchAccounts:
     def test_filters_by_owner_substring(self, bank: Bank, client: Client):
         bank.open_account(client.client_id)

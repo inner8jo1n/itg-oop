@@ -5,7 +5,9 @@ import pytest
 
 from bank.accounts.bank_account import BankAccount
 from bank.accounts.premium_account import PremiumAccount
-from bank.enums import Currency, TransactionType
+from bank.audit.audit_log import AuditLog
+from bank.audit.risk_analyzer import RiskAnalyzer
+from bank.enums import AuditSeverity, Currency, TransactionType
 from bank.exceptions import (
     ExchangeRateNotFoundError,
     InvalidOperationError,
@@ -14,6 +16,8 @@ from bank.exceptions import (
 from bank.transactions.transaction import Transaction
 from bank.transactions.transaction_processor import TransactionProcessor
 from bank.transactions.transaction_queue import TransactionQueue
+
+DAY_TIME = datetime(2024, 1, 1, 12, 0, 0)
 
 
 def bind_flaky_hook(account: BankAccount, fail_times: int) -> None:
@@ -510,3 +514,250 @@ class TestProcessQueue:
     def test_empty_queue_returns_empty_list(self):
         queue = TransactionQueue()
         assert TransactionProcessor().process_queue(queue) == []
+
+
+class TestRiskAnalyzerIntegration:
+    def test_blocks_high_risk_transaction_before_touching_accounts(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "failed"
+        assert "Blocked by risk analysis" in tx.failure_reason
+        assert account.balance == Decimal("100")
+        assert other_account.balance == Decimal("500")
+
+    def test_blocked_transaction_never_calls_the_handler(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.attempts == 0
+
+    def test_allows_low_risk_transaction_through(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+
+    def test_medium_risk_transaction_is_not_blocked(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        # first transfer to other_account is a new recipient: exactly
+        # one risk factor, MEDIUM, must still go through
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+
+    def test_no_risk_analyzer_preserves_default_behavior(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("1000000"),
+            sender=account,
+            receiver=other_account,
+        )
+        TransactionProcessor().process(tx)
+        assert tx.status.value == "failed"
+        assert "Blocked by risk analysis" not in tx.failure_reason
+
+    def test_resubmitting_a_blocked_transfer_is_blocked_again(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        # Regression test: a HIGH-risk transfer to a brand-new
+        # recipient must not be "learnable" from the blocked attempt
+        # itself. If it were, resubmitting the exact same transfer
+        # would drop new_recipient (since the recipient was "seen"
+        # by the blocked attempt) and let a merely-MEDIUM large
+        # amount through on the second try.
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        first = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(first)
+        assert first.status.value == "failed"
+
+        second = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(second)
+        assert second.status.value == "failed"
+        assert "Blocked by risk analysis" in second.failure_reason
+        assert account.balance == Decimal("100")
+        assert other_account.balance == Decimal("500")
+
+
+class TestAuditLogIntegration:
+    def test_logs_one_entry_per_processed_transaction(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(audit_log=audit_log)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert len(audit_log.entries) == 1
+        entry = audit_log.entries[0]
+        assert entry.transaction_id == tx.transaction_id
+        assert entry.account_id == account.account_id
+        assert entry.client == account.owner
+
+    def test_blocked_transaction_logged_as_critical(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, audit_log=audit_log
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert audit_log.entries[0].severity == AuditSeverity.CRITICAL
+
+    def test_medium_risk_completed_transaction_logged_as_warning(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, audit_log=audit_log
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert audit_log.entries[0].severity == AuditSeverity.WARNING
+
+    def test_low_risk_completed_transaction_logged_as_info(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, audit_log=audit_log
+        )
+        # prime the recipient as known first so the real assertion
+        # below has zero triggered risk factors
+        processor.process(
+            Transaction(
+                type=TransactionType.TRANSFER,
+                amount=Decimal("1"),
+                sender=account,
+                receiver=other_account,
+            )
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("1"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert audit_log.entries[1].severity == AuditSeverity.INFO
+
+    def test_non_risk_failure_logged_as_warning(self, account: BankAccount):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(audit_log=audit_log)
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("1000"),
+            sender=account,
+        )
+        processor.process(tx)
+        assert audit_log.entries[0].severity == AuditSeverity.WARNING
+
+    def test_no_audit_log_preserves_default_behavior(
+        self, account: BankAccount
+    ):
+        tx = Transaction(
+            type=TransactionType.DEPOSIT,
+            amount=Decimal("10"),
+            receiver=account,
+        )
+        TransactionProcessor().process(tx)
+        assert tx.status.value == "completed"
+
+    def test_audit_write_failure_does_not_crash_a_completed_transaction(
+        self, account: BankAccount, tmp_path
+    ):
+        # A directory, not a file: AuditLog._append_to_file's open()
+        # will raise IsADirectoryError. The transaction has already
+        # completed by the time _log_outcome runs, so that failure
+        # must be swallowed rather than propagated out of process().
+        broken_path = tmp_path / "not_a_file"
+        broken_path.mkdir()
+        audit_log = AuditLog(file_path=broken_path, clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(audit_log=audit_log)
+        tx = Transaction(
+            type=TransactionType.DEPOSIT,
+            amount=Decimal("10"),
+            receiver=account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        assert account.balance == Decimal("110")

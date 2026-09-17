@@ -64,3 +64,23 @@ class TransactionStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class AuditSeverity(StrEnum):
+    """
+    Importance levels of an audit log entry.
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class RiskLevel(StrEnum):
+    """
+    Risk levels a RiskAnalyzer can assign to an operation.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"

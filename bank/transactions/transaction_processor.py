@@ -4,7 +4,15 @@ from datetime import datetime
 from decimal import Decimal
 
 from bank.accounts.bank_account import BankAccount
-from bank.enums import Currency, TransactionStatus, TransactionType
+from bank.audit.audit_log import AuditLog
+from bank.audit.risk_analyzer import RiskAnalyzer, RiskAssessment
+from bank.enums import (
+    AuditSeverity,
+    Currency,
+    RiskLevel,
+    TransactionStatus,
+    TransactionType,
+)
 from bank.exceptions import (
     BankError,
     ExchangeRateNotFoundError,
@@ -39,6 +47,8 @@ class TransactionProcessor:
             OperationNotAllowedError,
         ),
         clock: Callable[[], datetime] = datetime.now,
+        risk_analyzer: RiskAnalyzer | None = None,
+        audit_log: AuditLog | None = None,
     ):
         """
         Create a transaction processor.
@@ -54,6 +64,11 @@ class TransactionProcessor:
             retry instead of immediately failing the transaction
         :param clock: callable returning the current datetime, used
             to stamp completion/failure times
+        :param risk_analyzer: optional analyzer consulted before
+            each transaction; HIGH-risk transactions are blocked
+            before any account is touched
+        :param audit_log: optional log that records one entry per
+            processed transaction's final outcome
         """
         if not isinstance(max_retries, int) or max_retries < 1:
             raise InvalidOperationError(
@@ -74,6 +89,8 @@ class TransactionProcessor:
         self._max_retries = max_retries
         self._retryable_errors = retryable_errors
         self._clock = clock
+        self._risk_analyzer = risk_analyzer
+        self._audit_log = audit_log
         self._handlers: dict[TransactionType, _Handler] = {
             TransactionType.DEPOSIT: self._execute_deposit,
             TransactionType.WITHDRAWAL: self._execute_withdrawal,
@@ -240,7 +257,11 @@ class TransactionProcessor:
     def process(self, transaction: Transaction) -> None:
         """
         Process a single transaction, retrying on transient errors
-        up to the configured limit before marking it failed.
+        up to the configured limit before marking it failed. If a
+        RiskAnalyzer is configured and assesses the transaction as
+        HIGH risk, it is blocked before any account is touched.
+        Every outcome (blocked, completed, or failed) is recorded
+        to the configured AuditLog, if any.
 
         :param transaction: transaction to process; must be PENDING,
             or SCHEDULED with `scheduled_at` already due
@@ -260,6 +281,26 @@ class TransactionProcessor:
                 f"scheduled for {transaction.scheduled_at}, which "
                 f"has not yet arrived"
             )
+
+        assessment = (
+            self._risk_analyzer.assess(transaction)
+            if self._risk_analyzer is not None
+            else None
+        )
+        if assessment is not None and assessment.level == RiskLevel.HIGH:
+            transaction.mark_processing()
+            transaction.mark_failed(
+                f"Blocked by risk analysis: {', '.join(assessment.reasons)}",
+                at=self._clock(),
+            )
+            logger.error(
+                "transaction %s blocked by risk analysis: %s",
+                transaction.transaction_id,
+                assessment,
+            )
+            self._log_outcome(transaction, assessment)
+            return
+
         transaction.mark_processing()
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
@@ -283,6 +324,7 @@ class TransactionProcessor:
                     err,
                 )
                 transaction.mark_failed(str(err), at=self._clock())
+                self._log_outcome(transaction, assessment)
                 return
             else:
                 logger.info(
@@ -292,6 +334,9 @@ class TransactionProcessor:
                     self._max_retries,
                 )
                 transaction.mark_completed(at=self._clock())
+                if self._risk_analyzer is not None:
+                    self._risk_analyzer.record_completed(transaction)
+                self._log_outcome(transaction, assessment)
                 return
         logger.error(
             "transaction %s exhausted %d attempts, last error: %s",
@@ -303,6 +348,80 @@ class TransactionProcessor:
             f"Failed after {self._max_retries} attempts: {last_error}",
             at=self._clock(),
         )
+        self._log_outcome(transaction, assessment)
+
+    def _log_outcome(
+        self, transaction: Transaction, assessment: RiskAssessment | None
+    ) -> None:
+        """
+        Record one audit entry for a transaction's final outcome, if
+        an AuditLog is configured. No-op otherwise. The transaction
+        has already reached its terminal status by the time this is
+        called, so a failure to write the audit entry is logged and
+        swallowed rather than propagated: an observability problem
+        must never look like the transaction itself failed after
+        already completing successfully.
+
+        :param transaction: transaction that just reached a
+            terminal status (COMPLETED or FAILED)
+        :param assessment: the risk assessment made for this
+            transaction, if a RiskAnalyzer was configured
+        :return: None
+        """
+        if self._audit_log is None:
+            return
+        account = transaction.sender or transaction.receiver
+        try:
+            self._audit_log.record(
+                severity=self._severity_for(transaction, assessment),
+                event=f"transaction_{transaction.status.value}",
+                message=str(transaction),
+                client=account.owner if account is not None else None,
+                account_id=(
+                    account.account_id if account is not None else None
+                ),
+                transaction_id=transaction.transaction_id,
+                metadata={
+                    "risk_level": (
+                        assessment.level.value if assessment else None
+                    ),
+                    "risk_reasons": (assessment.reasons if assessment else []),
+                    "amount": transaction.amount,
+                    "fee": transaction.fee,
+                },
+            )
+        except Exception:
+            logger.critical(
+                "transaction %s: failed to write audit entry for "
+                "outcome %s; the transaction itself already reached "
+                "a terminal state and is unaffected",
+                transaction.transaction_id,
+                transaction.status.value,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _severity_for(
+        transaction: Transaction, assessment: RiskAssessment | None
+    ) -> AuditSeverity:
+        """
+        Derive an audit severity from a transaction's outcome and
+        its risk assessment.
+
+        :param transaction: transaction that reached a terminal
+            status
+        :param assessment: risk assessment made for this
+            transaction, if any
+        :return: CRITICAL if blocked/high risk, WARNING if failed or
+            medium risk, INFO otherwise
+        """
+        if assessment is not None and assessment.level == RiskLevel.HIGH:
+            return AuditSeverity.CRITICAL
+        if transaction.status == TransactionStatus.FAILED:
+            return AuditSeverity.WARNING
+        if assessment is not None and assessment.level == RiskLevel.MEDIUM:
+            return AuditSeverity.WARNING
+        return AuditSeverity.INFO
 
     def process_queue(
         self, queue: TransactionQueue, limit: int | None = None
