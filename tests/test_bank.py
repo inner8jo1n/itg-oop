@@ -6,9 +6,11 @@ import pytest
 
 from bank.accounts.premium_account import PremiumAccount
 from bank.accounts.savings_account import SavingsAccount
+from bank.audit.audit_log import AuditLog
+from bank.audit.risk_analyzer import RiskAnalyzer
 from bank.bank import Bank
 from bank.client import Client
-from bank.enums import AccountStatus, Currency
+from bank.enums import AccountStatus, AuditSeverity, Currency
 from bank.exceptions import (
     AccountNotFoundError,
     AuthenticationError,
@@ -16,8 +18,10 @@ from bank.exceptions import (
     ClientNotFoundError,
     InvalidOperationError,
     OperationNotAllowedError,
+    RiskBlockedError,
 )
 
+DAY_TIME = datetime(2024, 1, 1, 12, 0, 0)
 NIGHT_TIME = datetime(2024, 1, 1, 2, 0, 0)
 
 
@@ -301,39 +305,187 @@ class TestWithdrawFromAccount:
         assert client.is_suspicious is True
 
 
-class TestBankHasNoRiskOrAuditIntegration:
+class TestBankRiskAndAuditIntegration:
     """
-    Bank.withdraw_from_account only ever flags the owning client
-    after the fact (see TestWithdrawFromAccount above) - it never
-    consults a RiskAnalyzer and can never block a dangerous operation
-    the way a risk-aware TransactionProcessor can. Bank's constructor
-    has no parameter to plug a RiskAnalyzer or AuditLog in at all, so
-    there is currently no way to make the Bank facade itself enforce
-    "block dangerous operations" - only a caller who separately
-    builds their own risk-aware TransactionProcessor gets that.
+    Bank.withdraw_from_account can be wired to a RiskAnalyzer and an
+    AuditLog: a HIGH-risk withdrawal is blocked with RiskBlockedError
+    before the balance is touched, and every withdrawal attempt is
+    recorded to the AuditLog when one is configured. Without a
+    RiskAnalyzer configured (the default), behavior is unchanged from
+    before this feature existed: dangerous withdrawals still only get
+    flagged after the fact, never refused.
     """
 
-    def test_constructor_accepts_no_risk_analyzer_parameter(self):
-        with pytest.raises(TypeError):
-            Bank(name="X", risk_analyzer=object())
+    @staticmethod
+    def _open_account(bank: Bank, adult_birth_date, balance: Decimal):
+        client = bank.add_client(
+            full_name="Petr Sidorov",
+            birth_date=adult_birth_date,
+            phone="+79990000000",
+            password="secret123",
+        )
+        account = bank.open_account(client.client_id, initial_balance=balance)
+        return client, account
 
-    def test_constructor_accepts_no_audit_log_parameter(self):
-        with pytest.raises(TypeError):
-            Bank(name="X", audit_log=object())
+    def test_constructor_accepts_risk_analyzer_and_audit_log(self):
+        bank = Bank(
+            name="X",
+            risk_analyzer=RiskAnalyzer(clock=lambda: DAY_TIME),
+            audit_log=AuditLog(clock=lambda: DAY_TIME),
+        )
+        assert bank is not None
 
-    def test_arbitrarily_large_withdrawal_is_never_blocked(
+    def test_high_risk_withdrawal_is_blocked_before_balance_changes(
+        self, adult_birth_date
+    ):
+        # large_amount (threshold 1000) + night_operation (analyzer
+        # clock at 02:00, Bank's own clock stays at noon so the
+        # unrelated Day 3 night restriction never interferes here)
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000"), clock=lambda: NIGHT_TIME
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("100000")
+        )
+        with pytest.raises(RiskBlockedError):
+            bank.withdraw_from_account(account.account_id, Decimal("2000"))
+        assert account.balance == Decimal("100000")
+
+    def test_blocked_withdrawal_also_flags_client_suspicious(
+        self, adult_birth_date
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000"), clock=lambda: NIGHT_TIME
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        client, account = self._open_account(
+            bank, adult_birth_date, Decimal("100000")
+        )
+        with pytest.raises(RiskBlockedError):
+            bank.withdraw_from_account(account.account_id, Decimal("2000"))
+        assert client.is_suspicious is True
+
+    def test_low_risk_withdrawal_still_succeeds(self, adult_birth_date):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("1000")
+        )
+        bank.withdraw_from_account(account.account_id, Decimal("100"))
+        assert account.balance == Decimal("900")
+
+    def test_audit_log_records_blocked_withdrawal_as_critical(
+        self, adult_birth_date
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000"), clock=lambda: NIGHT_TIME
+        )
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        bank = Bank(
+            name="X",
+            clock=lambda: DAY_TIME,
+            risk_analyzer=risk_analyzer,
+            audit_log=audit_log,
+        )
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("100000")
+        )
+        with pytest.raises(RiskBlockedError):
+            bank.withdraw_from_account(account.account_id, Decimal("2000"))
+        assert len(audit_log.entries) == 1
+        assert audit_log.entries[0].severity == AuditSeverity.CRITICAL
+
+    def test_audit_log_records_successful_withdrawal_as_info(
+        self, adult_birth_date
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        bank = Bank(
+            name="X",
+            clock=lambda: DAY_TIME,
+            risk_analyzer=risk_analyzer,
+            audit_log=audit_log,
+        )
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("1000")
+        )
+        bank.withdraw_from_account(account.account_id, Decimal("100"))
+        assert audit_log.entries[0].severity == AuditSeverity.INFO
+
+    def test_without_risk_analyzer_behavior_is_unchanged(
         self, bank: Bank, client: Client
     ):
-        # However large, this only ever flags the client after the
-        # money has already moved - it is never refused for being
-        # risky, unlike TransactionProcessor with a RiskAnalyzer
-        # configured (see TestRiskAnalyzerIntegration).
+        # No RiskAnalyzer configured on this bank (the default `bank`
+        # fixture): a large withdrawal still only gets flagged after
+        # the fact, exactly as before this feature existed - it is
+        # never blocked.
         account = bank.open_account(
             client.client_id, initial_balance=Decimal("100000000")
         )
         bank.withdraw_from_account(account.account_id, Decimal("99000000"))
         assert account.balance == Decimal("1000000")
         assert client.is_suspicious is True
+
+    def test_plain_withdrawal_excluded_from_suspicious_report(
+        self, adult_birth_date
+    ):
+        # No RiskAnalyzer configured: a withdrawal that fails for an
+        # ordinary business reason has no risk factors at all and
+        # must not appear in the suspicious-operations report.
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        bank = Bank(name="X", clock=lambda: DAY_TIME, audit_log=audit_log)
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("1000")
+        )
+        bank.withdraw_from_account(account.account_id, Decimal("100"))
+        assert audit_log.suspicious_operations_report() == []
+        assert audit_log.error_statistics()["total"] == 0
+
+    def test_direct_account_withdraw_is_also_blocked(self, adult_birth_date):
+        # Regression test: risk checking must not be bypassable by
+        # calling account.withdraw() directly instead of going
+        # through Bank.withdraw_from_account(). The check is bound
+        # as the account's before_withdraw hook in open_account(),
+        # so it fires no matter which entry point is used.
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000"), clock=lambda: NIGHT_TIME
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        client, account = self._open_account(
+            bank, adult_birth_date, Decimal("100000")
+        )
+        with pytest.raises(RiskBlockedError):
+            account.withdraw(Decimal("2000"))
+        assert account.balance == Decimal("100000")
+        assert client.is_suspicious is True
+
+    def test_direct_account_withdraw_still_succeeds_when_low_risk(
+        self, adult_birth_date
+    ):
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        _, account = self._open_account(
+            bank, adult_birth_date, Decimal("1000")
+        )
+        account.withdraw(Decimal("100"))
+        assert account.balance == Decimal("900")
 
 
 class TestSearchAccounts:

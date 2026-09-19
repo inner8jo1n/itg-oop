@@ -761,3 +761,60 @@ class TestAuditLogIntegration:
         processor.process(tx)
         assert tx.status.value == "completed"
         assert account.balance == Decimal("110")
+
+    def test_plain_failure_excluded_from_suspicious_report(
+        self, account: BankAccount
+    ):
+        # Regression test: an ordinary insufficient-funds failure
+        # (no RiskAnalyzer configured, so zero risk factors) must
+        # not show up as a "suspicious operation" just because it
+        # failed and got WARNING severity.
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(audit_log=audit_log)
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("1000"),
+            sender=account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "failed"
+        assert audit_log.suspicious_operations_report() == []
+
+    def test_plain_failure_counted_in_error_statistics(
+        self, account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(audit_log=audit_log)
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("1000"),
+            sender=account,
+        )
+        processor.process(tx)
+        stats = audit_log.error_statistics()
+        assert stats["total"] == 1
+        assert stats["by_event"] == {"transaction_failed": 1}
+
+    def test_successful_transaction_excluded_from_error_statistics(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        audit_log = AuditLog(clock=lambda: DAY_TIME)
+        risk_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
+        )
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, audit_log=audit_log
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        # MEDIUM risk (new_recipient), so it belongs in the
+        # suspicious report, but it succeeded so it must not appear
+        # in error_statistics().
+        assert len(audit_log.suspicious_operations_report()) == 1
+        assert audit_log.error_statistics()["total"] == 0

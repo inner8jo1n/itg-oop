@@ -1,10 +1,19 @@
+import logging
 from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
 
 from bank.accounts import BankAccount
+from bank.audit.audit_log import AuditLog
+from bank.audit.risk_analyzer import RiskAnalyzer, RiskAssessment
 from bank.client import Client
-from bank.enums import AccountStatus, Currency
+from bank.enums import (
+    AccountStatus,
+    AuditSeverity,
+    Currency,
+    RiskLevel,
+    TransactionType,
+)
 from bank.exceptions import (
     AccountNotFoundError,
     AuthenticationError,
@@ -12,7 +21,11 @@ from bank.exceptions import (
     ClientNotFoundError,
     InvalidOperationError,
     OperationNotAllowedError,
+    RiskBlockedError,
 )
+from bank.transactions.transaction import Transaction
+
+logger = logging.getLogger(__name__)
 
 
 class Bank:
@@ -30,6 +43,8 @@ class Bank:
         name: str,
         clock: Callable[[], datetime] = datetime.now,
         suspicious_withdrawal_threshold: Decimal = Decimal("1000000"),
+        risk_analyzer: RiskAnalyzer | None = None,
+        audit_log: AuditLog | None = None,
     ):
         """
         Create a bank with an empty client and account registry.
@@ -39,10 +54,19 @@ class Bank:
             to enforce the night-time operation restriction
         :param suspicious_withdrawal_threshold: withdrawal amount
             above which a client is flagged as suspicious
+        :param risk_analyzer: optional analyzer consulted before
+            every withdrawal made through withdraw_from_account;
+            a HIGH-risk withdrawal is blocked before the balance is
+            touched at all
+        :param audit_log: optional log that records one entry per
+            withdrawal made through withdraw_from_account
         """
         self._name = name
         self._clock = clock
         self._suspicious_withdrawal_threshold = suspicious_withdrawal_threshold
+        self._risk_analyzer = risk_analyzer
+        self._audit_log = audit_log
+        self._last_withdrawal_assessment: RiskAssessment | None = None
         self._clients: dict[str, Client] = {}
         self._accounts: dict[str, BankAccount] = {}
         self._account_owners: dict[str, str] = {}
@@ -209,6 +233,9 @@ class Bank:
             after_withdraw=lambda withdrawn: self._flag_if_large_withdrawal(
                 account, withdrawn
             ),
+            before_withdraw=lambda amount: self._check_withdrawal_risk(
+                account, amount
+            ),
         )
         return account
 
@@ -269,14 +296,143 @@ class Bank:
     def withdraw_from_account(self, account_id: str, amount) -> None:
         """
         Withdraw funds from an account, flagging the owning client as
-        suspicious if the withdrawn amount is unusually large.
+        suspicious if the withdrawn amount is unusually large. Risk
+        analysis (if a RiskAnalyzer is configured) runs via the
+        account's before_withdraw hook - see open_account and
+        _check_withdrawal_risk - before the balance ever changes, so
+        a HIGH-risk withdrawal is blocked with RiskBlockedError
+        whether it is requested here or via account.withdraw()
+        directly; there is no balance-changing path that skips it.
 
         :param account_id: account identifier
         :param amount: amount to withdraw
         :return: None
         """
         account = self._get_account(account_id)
+        self._last_withdrawal_assessment = None
         account.withdraw(amount)
+        self._log_withdrawal(
+            account, amount, self._last_withdrawal_assessment, blocked=False
+        )
+
+    def _assess_withdrawal_risk(
+        self, account: BankAccount, amount
+    ) -> RiskAssessment | None:
+        """
+        Assess a withdrawal against this bank's RiskAnalyzer, if one
+        is configured, via a throwaway WITHDRAWAL transaction built
+        purely to describe the operation to the analyzer.
+
+        :param account: account the withdrawal is from
+        :param amount: amount to withdraw
+        :return: the resulting assessment, or None if no RiskAnalyzer
+            is configured on this bank
+        """
+        if self._risk_analyzer is None:
+            return None
+        transaction = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=amount,
+            currency=account.currency,
+            sender=account,
+        )
+        return self._risk_analyzer.assess(transaction)
+
+    def _check_withdrawal_risk(self, account: BankAccount, amount) -> None:
+        """
+        Bound as every bank-opened account's before_withdraw hook
+        (see open_account), so this runs before ANY withdrawal
+        changes the balance, whether requested via
+        withdraw_from_account() or by calling account.withdraw()
+        directly - there is no balance-changing path that can skip
+        it. Raises RiskBlockedError, flags the owning client
+        suspicious and logs a CRITICAL audit entry if risk analysis
+        flags the withdrawal as HIGH risk.
+
+        The resulting assessment is stashed on this bank so
+        withdraw_from_account() can log an accurate success entry
+        once the withdrawal has actually completed (whether it
+        clears validation such as insufficient-funds checks is not
+        yet known at this point), without assessing the same
+        withdrawal a second time - which would double-count it in
+        the analyzer's frequency tracking.
+
+        :param account: account about to be withdrawn from
+        :param amount: amount about to be withdrawn
+        :return: None
+        """
+        assessment = self._assess_withdrawal_risk(account, amount)
+        self._last_withdrawal_assessment = assessment
+        if assessment is None or assessment.level != RiskLevel.HIGH:
+            return
+        client = self._get_client_for_account(account.account_id)
+        if client is not None:
+            client.flag_suspicious(
+                "Withdrawal blocked by risk analysis: "
+                f"{', '.join(assessment.reasons)}"
+            )
+        self._log_withdrawal(account, amount, assessment, blocked=True)
+        raise RiskBlockedError(
+            f"Withdrawal from {account.account_id} blocked by risk "
+            f"analysis: {', '.join(assessment.reasons)}"
+        )
+
+    def _log_withdrawal(
+        self,
+        account: BankAccount,
+        amount,
+        assessment: RiskAssessment | None,
+        blocked: bool,
+    ) -> None:
+        """
+        Record one audit entry for a withdrawal attempt, if an
+        AuditLog is configured on this bank. No-op otherwise. A
+        failure to write the entry is logged and swallowed rather
+        than propagated, so an observability problem can never look
+        like the withdrawal itself failed after already succeeding.
+
+        :param account: account the withdrawal was from
+        :param amount: amount requested
+        :param assessment: risk assessment made for this withdrawal,
+            if a RiskAnalyzer was configured
+        :param blocked: whether the withdrawal was blocked
+        :return: None
+        """
+        if self._audit_log is None:
+            return
+        if blocked:
+            severity = AuditSeverity.CRITICAL
+        elif assessment is not None and assessment.level == RiskLevel.MEDIUM:
+            severity = AuditSeverity.WARNING
+        else:
+            severity = AuditSeverity.INFO
+        try:
+            self._audit_log.record(
+                severity=severity,
+                event="withdrawal_blocked" if blocked else "withdrawal",
+                message=(
+                    f"Withdrawal of {amount} from {account.account_id} "
+                    f"{'blocked' if blocked else 'completed'}"
+                ),
+                client=account.owner,
+                account_id=account.account_id,
+                metadata={
+                    "success": not blocked,
+                    "risk_level": (
+                        assessment.level.value if assessment else None
+                    ),
+                    "risk_reasons": (assessment.reasons if assessment else []),
+                    "amount": amount,
+                },
+            )
+        except Exception:
+            logger.critical(
+                "account %s: failed to write audit entry for "
+                "withdrawal outcome (blocked=%s)",
+                account.account_id,
+                blocked,
+                exc_info=True,
+            )
 
     def _flag_if_large_withdrawal(
         self, account: BankAccount, withdrawn: Decimal

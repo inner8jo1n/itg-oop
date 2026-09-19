@@ -80,6 +80,7 @@ class SavingsAccount(BankAccount):
         :return: None
         """
         self._ensure_operable()
+        self._notify_before_withdraw(amount)
         validated = self._validate_amount(amount)
         if self._balance - validated < self._min_balance:
             raise InsufficientFundsError(

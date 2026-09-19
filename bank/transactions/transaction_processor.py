@@ -382,6 +382,9 @@ class TransactionProcessor:
                 ),
                 transaction_id=transaction.transaction_id,
                 metadata={
+                    "success": (
+                        transaction.status == TransactionStatus.COMPLETED
+                    ),
                     "risk_level": (
                         assessment.level.value if assessment else None
                     ),

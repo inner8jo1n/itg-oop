@@ -24,6 +24,7 @@ class AbstractAccount(ABC):
         self._balance = initial_balance
         self._status = AccountStatus.ACTIVE
         self._before_operation: Callable[[], None] | None = None
+        self._before_withdraw: Callable[[Decimal], None] | None = None
         self._after_withdraw: Callable[[Decimal], None] | None = None
 
     @property
@@ -66,6 +67,7 @@ class AbstractAccount(ABC):
         self,
         before_operation: Callable[[], None],
         after_withdraw: Callable[[Decimal], None],
+        before_withdraw: Callable[[Decimal], None] | None = None,
     ) -> None:
         """
         Attach the bank-level checks that every mutating operation on
@@ -76,10 +78,27 @@ class AbstractAccount(ABC):
             if the operation is not currently allowed
         :param after_withdraw: called with the amount debited after
             each successful withdrawal, to flag suspicious activity
+        :param before_withdraw: called with the requested (not yet
+            validated) amount before a withdrawal changes the
+            balance; may raise to block the withdrawal entirely,
+            e.g. based on risk analysis
         :return: None
         """
         self._before_operation = before_operation
         self._after_withdraw = after_withdraw
+        self._before_withdraw = before_withdraw
+
+    def _notify_before_withdraw(self, amount) -> None:
+        """
+        Give the bound bank hook a chance to block a withdrawal
+        before any balance change, regardless of whether withdraw()
+        was called through the bank or directly on this account.
+
+        :param amount: amount about to be withdrawn, unvalidated
+        :return: None
+        """
+        if self._before_withdraw is not None:
+            self._before_withdraw(amount)
 
     def _ensure_operable(self) -> None:
         """

@@ -87,6 +87,7 @@ class PremiumAccount(BankAccount):
         :return: None
         """
         self._ensure_operable()
+        self._notify_before_withdraw(amount)
         validated = self._validate_amount(amount)
         if validated > self._withdrawal_limit:
             raise InvalidOperationError(

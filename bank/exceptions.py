@@ -93,3 +93,12 @@ class ExchangeRateNotFoundError(BankError):
     """
 
     pass
+
+
+class RiskBlockedError(BankError):
+    """
+    Raised when an operation is blocked by risk analysis before any
+    balance was touched.
+    """
+
+    pass

@@ -109,6 +109,7 @@ class BankAccount(AbstractAccount):
         :return: None
         """
         self._ensure_operable()
+        self._notify_before_withdraw(amount)
         validated = self._validate_amount(amount)
         if validated > self._balance:
             raise InsufficientFundsError(

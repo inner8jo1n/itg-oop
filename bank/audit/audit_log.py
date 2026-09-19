@@ -310,15 +310,19 @@ class AuditLog:
 
     def suspicious_operations_report(self) -> list[AuditEntry]:
         """
-        Get all entries flagged as suspicious, i.e. anything above
-        INFO severity.
+        Get all entries actually flagged by risk analysis, i.e. ones
+        whose metadata records at least one triggered risk reason.
+        Severity is deliberately not used for this: an entry can be
+        WARNING purely from an ordinary business failure (e.g.
+        insufficient funds) with zero risk factors, which is a
+        failure, not a suspicious operation.
 
-        :return: list of WARNING/CRITICAL entries, oldest first
+        :return: entries with at least one risk reason, oldest first
         """
         return [
             entry
             for entry in self._entries
-            if entry.severity != AuditSeverity.INFO
+            if entry.metadata.get("risk_reasons")
         ]
 
     def client_risk_profile(self, client: str) -> dict:
@@ -356,21 +360,31 @@ class AuditLog:
 
     def error_statistics(self) -> dict:
         """
-        Summarize how many recorded entries fall into each severity
-        and event category, across the whole log.
+        Summarize failed/blocked entries only, by severity and event
+        name. An entry counts as a failure when its metadata's
+        "success" key is explicitly False; entries that never set
+        that key, or set it True, are excluded, so an ordinary
+        successful entry (e.g. transaction_completed) can never be
+        miscounted as an error just because of its severity or name.
 
-        :return: dictionary with total entry count, counts by
-            severity, and counts by event name
+        :return: dictionary with total failure count, counts by
+            severity, and counts by event name - restricted to
+            failed/blocked entries
         """
+        failures = [
+            entry
+            for entry in self._entries
+            if entry.metadata.get("success") is False
+        ]
         by_severity: dict[str, int] = {}
         by_event: dict[str, int] = {}
-        for entry in self._entries:
+        for entry in failures:
             by_severity[entry.severity.value] = (
                 by_severity.get(entry.severity.value, 0) + 1
             )
             by_event[entry.event] = by_event.get(entry.event, 0) + 1
         return {
-            "total": len(self._entries),
+            "total": len(failures),
             "by_severity": by_severity,
             "by_event": by_event,
         }

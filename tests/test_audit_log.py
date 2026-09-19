@@ -288,45 +288,73 @@ class TestAuditLogFilter:
 class TestAuditLogReports:
     def _build_log(self) -> AuditLog:
         log = AuditLog(clock=lambda: DAY_TIME)
+        # clean, unremarkable success: not suspicious, not an error
         log.record(
             severity=AuditSeverity.INFO,
             event="transaction_completed",
             message="ok",
             client="Anna",
-            metadata={"risk_reasons": []},
+            metadata={"success": True, "risk_reasons": []},
         )
+        # MEDIUM risk but still succeeded: suspicious, but NOT an
+        # error - this must never show up in error_statistics()
         log.record(
             severity=AuditSeverity.WARNING,
             event="transaction_completed",
             message="flagged",
             client="Anna",
-            metadata={"risk_reasons": ["new_recipient"]},
+            metadata={"success": True, "risk_reasons": ["new_recipient"]},
         )
+        # HIGH risk, blocked: both suspicious AND an error
         log.record(
             severity=AuditSeverity.CRITICAL,
             event="transaction_failed",
             message="blocked",
             client="Anna",
-            metadata={"risk_reasons": ["large_amount", "new_recipient"]},
+            metadata={
+                "success": False,
+                "risk_reasons": ["large_amount", "new_recipient"],
+            },
         )
+        # ordinary business failure, zero risk factors: an error,
+        # but NOT suspicious - this is the exact bug scenario from
+        # the review (insufficient funds must not count as
+        # "suspicious" just because the transaction failed)
         log.record(
             severity=AuditSeverity.WARNING,
             event="transaction_failed",
             message="insufficient funds",
             client="Oleg",
-            metadata={"risk_reasons": []},
+            metadata={"success": False, "risk_reasons": []},
         )
         return log
 
-    def test_suspicious_operations_report_excludes_info(self):
+    def test_suspicious_operations_report_only_includes_risk_flagged(self):
         log = self._build_log()
         report = log.suspicious_operations_report()
-        assert len(report) == 3
-        assert all(e.severity != AuditSeverity.INFO for e in report)
+        assert {e.message for e in report} == {"flagged", "blocked"}
+
+    def test_suspicious_operations_report_excludes_plain_failure(self):
+        # the review's exact scenario: an ordinary insufficient-funds
+        # failure has WARNING severity but zero risk factors, so it
+        # must not be reported as a suspicious operation.
+        log = self._build_log()
+        report = log.suspicious_operations_report()
+        assert "insufficient funds" not in {e.message for e in report}
 
     def test_suspicious_operations_report_empty_when_all_info(self):
         log = AuditLog(clock=lambda: DAY_TIME)
         log.record(severity=AuditSeverity.INFO, event="e", message="m")
+        assert log.suspicious_operations_report() == []
+
+    def test_suspicious_operations_report_empty_when_no_risk_reasons(self):
+        log = AuditLog(clock=lambda: DAY_TIME)
+        log.record(
+            severity=AuditSeverity.WARNING,
+            event="transaction_failed",
+            message="insufficient funds",
+            metadata={"success": False, "risk_reasons": []},
+        )
         assert log.suspicious_operations_report() == []
 
     def test_client_risk_profile_aggregates_severities_and_reasons(self):
@@ -366,19 +394,30 @@ class TestAuditLogReports:
         }
         assert profile["risk_reasons"] == []
 
-    def test_error_statistics_counts_by_severity_and_event(self):
+    def test_error_statistics_counts_only_failures(self):
         log = self._build_log()
         stats = log.error_statistics()
-        assert stats["total"] == 4
-        assert stats["by_severity"] == {
-            "info": 1,
-            "warning": 2,
-            "critical": 1,
-        }
-        assert stats["by_event"] == {
-            "transaction_completed": 2,
-            "transaction_failed": 2,
-        }
+        assert stats["total"] == 2
+        assert stats["by_severity"] == {"warning": 1, "critical": 1}
+        assert stats["by_event"] == {"transaction_failed": 2}
+
+    def test_error_statistics_excludes_successful_medium_risk(self):
+        # the review's other bug scenario: a MEDIUM-risk transaction
+        # that still completed successfully must never be counted as
+        # an "error" just because its severity is WARNING.
+        log = self._build_log()
+        stats = log.error_statistics()
+        assert stats["by_event"].get("transaction_completed") is None
+
+    def test_error_statistics_treats_missing_success_key_as_not_a_failure(
+        self,
+    ):
+        log = AuditLog(clock=lambda: DAY_TIME)
+        log.record(
+            severity=AuditSeverity.INFO, event="e", message="m", metadata={}
+        )
+        stats = log.error_statistics()
+        assert stats["total"] == 0
 
     def test_error_statistics_empty_log(self):
         log = AuditLog(clock=lambda: DAY_TIME)
