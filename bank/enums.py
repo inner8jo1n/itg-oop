@@ -84,3 +84,13 @@ class RiskLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class ReportType(StrEnum):
+    """
+    Kinds of reports a ReportBuilder can generate.
+    """
+
+    CLIENT = "client"
+    BANK = "bank"
+    RISK = "risk"

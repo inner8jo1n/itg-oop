@@ -56,11 +56,6 @@ def run(processor: TransactionProcessor, transaction: Transaction) -> None:
     print(transaction)
 
 
-# --------------------------------------------------------------------
-# Initialization
-# --------------------------------------------------------------------
-
-
 def create_clients(bank: Bank) -> dict[str, object]:
     roster = [
         ("Anna Volkova", date(1990, 5, 20), "+79990000001", "anna1"),
@@ -149,11 +144,6 @@ def open_accounts(bank: Bank, clients: dict) -> dict[str, BankAccount]:
     for account in a.values():
         print(account)
     return a
-
-
-# --------------------------------------------------------------------
-# Named transaction scenarios
-# --------------------------------------------------------------------
 
 
 def transfer(
@@ -316,11 +306,6 @@ def show_result(
         print(tx)
 
 
-# --------------------------------------------------------------------
-# Bulk simulation
-# --------------------------------------------------------------------
-
-
 def run_bulk_transactions(
     queue: TransactionQueue,
     processor: TransactionProcessor,
@@ -364,11 +349,6 @@ def run_bulk_transactions(
         outcomes[tx.status.value] = outcomes.get(tx.status.value, 0) + 1
     print(f"Обработано: {len(processed)} | по статусам: {outcomes}")
     return made
-
-
-# --------------------------------------------------------------------
-# User scenarios and reports
-# --------------------------------------------------------------------
 
 
 def show_client_scenario(
@@ -415,11 +395,6 @@ def show_reports(
     subsection("Общий баланс банка")
     for currency, total in bank.get_total_balance().items():
         print(f"{currency.value}: {total}")
-
-
-# --------------------------------------------------------------------
-# Bonus: Bank's own withdraw_from_account, separate from Transaction
-# --------------------------------------------------------------------
 
 
 def show_direct_bank_withdrawal(bank: Bank, acc: dict) -> None:
