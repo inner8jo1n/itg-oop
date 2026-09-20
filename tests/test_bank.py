@@ -423,18 +423,24 @@ class TestBankRiskAndAuditIntegration:
         bank.withdraw_from_account(account.account_id, Decimal("100"))
         assert audit_log.entries[0].severity == AuditSeverity.INFO
 
-    def test_without_risk_analyzer_behavior_is_unchanged(
+    def test_no_explicit_risk_analyzer_still_blocks_high_risk_withdrawal(
         self, bank: Bank, client: Client
     ):
-        # No RiskAnalyzer configured on this bank (the default `bank`
-        # fixture): a large withdrawal still only gets flagged after
-        # the fact, exactly as before this feature existed - it is
-        # never blocked.
+        # Regression test: a Bank built without an explicit
+        # risk_analyzer (the default `bank` fixture) must still
+        # perform risk analysis using default thresholds - there is
+        # no constructor path that skips risk checking entirely.
+        # Two small withdrawals build up frequency, then a third,
+        # large one crosses into HIGH risk (large_amount +
+        # frequent_operations) and must be blocked.
         account = bank.open_account(
             client.client_id, initial_balance=Decimal("100000000")
         )
-        bank.withdraw_from_account(account.account_id, Decimal("99000000"))
-        assert account.balance == Decimal("1000000")
+        bank.withdraw_from_account(account.account_id, Decimal("100"))
+        bank.withdraw_from_account(account.account_id, Decimal("100"))
+        with pytest.raises(RiskBlockedError):
+            bank.withdraw_from_account(account.account_id, Decimal("2000000"))
+        assert account.balance == Decimal("99999800")
         assert client.is_suspicious is True
 
     def test_plain_withdrawal_excluded_from_suspicious_report(

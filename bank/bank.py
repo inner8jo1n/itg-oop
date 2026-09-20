@@ -54,17 +54,25 @@ class Bank:
             to enforce the night-time operation restriction
         :param suspicious_withdrawal_threshold: withdrawal amount
             above which a client is flagged as suspicious
-        :param risk_analyzer: optional analyzer consulted before
-            every withdrawal made through withdraw_from_account;
+        :param risk_analyzer: analyzer consulted before every
+            withdrawal, whether made through withdraw_from_account
+            or via account.withdraw() directly (see open_account);
             a HIGH-risk withdrawal is blocked before the balance is
-            touched at all
+            touched at all. Risk analysis cannot be turned off - if
+            None, a RiskAnalyzer with default thresholds is created
+            instead, so every bank always checks risk; pass an
+            explicit instance to tune the thresholds
         :param audit_log: optional log that records one entry per
             withdrawal made through withdraw_from_account
         """
         self._name = name
         self._clock = clock
         self._suspicious_withdrawal_threshold = suspicious_withdrawal_threshold
-        self._risk_analyzer = risk_analyzer
+        self._risk_analyzer = (
+            risk_analyzer
+            if risk_analyzer is not None
+            else RiskAnalyzer(clock=clock)
+        )
         self._audit_log = audit_log
         self._last_withdrawal_assessment: RiskAssessment | None = None
         self._clients: dict[str, Client] = {}
@@ -297,12 +305,12 @@ class Bank:
         """
         Withdraw funds from an account, flagging the owning client as
         suspicious if the withdrawn amount is unusually large. Risk
-        analysis (if a RiskAnalyzer is configured) runs via the
-        account's before_withdraw hook - see open_account and
-        _check_withdrawal_risk - before the balance ever changes, so
-        a HIGH-risk withdrawal is blocked with RiskBlockedError
-        whether it is requested here or via account.withdraw()
-        directly; there is no balance-changing path that skips it.
+        analysis runs via the account's before_withdraw hook - see
+        open_account and _check_withdrawal_risk - before the balance
+        ever changes, so a HIGH-risk withdrawal is blocked with
+        RiskBlockedError whether it is requested here or via
+        account.withdraw() directly; there is no balance-changing
+        path that skips it.
 
         :param account_id: account identifier
         :param amount: amount to withdraw
@@ -311,25 +319,27 @@ class Bank:
         account = self._get_account(account_id)
         self._last_withdrawal_assessment = None
         account.withdraw(amount)
+        # account.withdraw() above always ran the before_withdraw
+        # hook first (every account in self._accounts was opened
+        # through open_account, which binds it unconditionally), so
+        # this is never still None at this point.
+        assert self._last_withdrawal_assessment is not None
         self._log_withdrawal(
             account, amount, self._last_withdrawal_assessment, blocked=False
         )
 
     def _assess_withdrawal_risk(
         self, account: BankAccount, amount
-    ) -> RiskAssessment | None:
+    ) -> RiskAssessment:
         """
-        Assess a withdrawal against this bank's RiskAnalyzer, if one
-        is configured, via a throwaway WITHDRAWAL transaction built
-        purely to describe the operation to the analyzer.
+        Assess a withdrawal against this bank's RiskAnalyzer via a
+        throwaway WITHDRAWAL transaction built purely to describe
+        the operation to the analyzer.
 
         :param account: account the withdrawal is from
         :param amount: amount to withdraw
-        :return: the resulting assessment, or None if no RiskAnalyzer
-            is configured on this bank
+        :return: the resulting assessment
         """
-        if self._risk_analyzer is None:
-            return None
         transaction = Transaction(
             type=TransactionType.WITHDRAWAL,
             amount=amount,
@@ -363,7 +373,7 @@ class Bank:
         """
         assessment = self._assess_withdrawal_risk(account, amount)
         self._last_withdrawal_assessment = assessment
-        if assessment is None or assessment.level != RiskLevel.HIGH:
+        if assessment.level != RiskLevel.HIGH:
             return
         client = self._get_client_for_account(account.account_id)
         if client is not None:
@@ -381,7 +391,7 @@ class Bank:
         self,
         account: BankAccount,
         amount,
-        assessment: RiskAssessment | None,
+        assessment: RiskAssessment,
         blocked: bool,
     ) -> None:
         """
@@ -393,8 +403,7 @@ class Bank:
 
         :param account: account the withdrawal was from
         :param amount: amount requested
-        :param assessment: risk assessment made for this withdrawal,
-            if a RiskAnalyzer was configured
+        :param assessment: risk assessment made for this withdrawal
         :param blocked: whether the withdrawal was blocked
         :return: None
         """
@@ -402,7 +411,7 @@ class Bank:
             return
         if blocked:
             severity = AuditSeverity.CRITICAL
-        elif assessment is not None and assessment.level == RiskLevel.MEDIUM:
+        elif assessment.level == RiskLevel.MEDIUM:
             severity = AuditSeverity.WARNING
         else:
             severity = AuditSeverity.INFO
@@ -418,10 +427,8 @@ class Bank:
                 account_id=account.account_id,
                 metadata={
                     "success": not blocked,
-                    "risk_level": (
-                        assessment.level.value if assessment else None
-                    ),
-                    "risk_reasons": (assessment.reasons if assessment else []),
+                    "risk_level": assessment.level.value,
+                    "risk_reasons": assessment.reasons,
                     "amount": amount,
                 },
             )

@@ -10,6 +10,7 @@ from bank.audit.risk_analyzer import RiskAnalyzer
 from bank.enums import AuditSeverity, Currency, TransactionType
 from bank.exceptions import (
     ExchangeRateNotFoundError,
+    InsufficientFundsError,
     InvalidOperationError,
     OperationNotAllowedError,
 )
@@ -54,46 +55,60 @@ def bind_fail_after(account: BankAccount, allow_calls: int) -> None:
     )
 
 
+def make_processor(**kwargs) -> TransactionProcessor:
+    """
+    Build a TransactionProcessor defaulting to a fixed daytime clock.
+    Risk analysis is now mandatory (see TransactionProcessor.__init__),
+    and its default RiskAnalyzer uses this same clock to decide
+    night_operation - without pinning it, a test run during real
+    night hours could unpredictably flag transactions as suspicious
+    or even block them. Tests that need a different clock, or that
+    supply their own risk_analyzer, still override it explicitly.
+    """
+    kwargs.setdefault("clock", lambda: DAY_TIME)
+    return TransactionProcessor(**kwargs)
+
+
 class TestConstruction:
     def test_rejects_zero_max_retries(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(max_retries=0)
+            make_processor(max_retries=0)
 
     def test_rejects_negative_max_retries(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(max_retries=-1)
+            make_processor(max_retries=-1)
 
     def test_rejects_non_int_max_retries(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(max_retries="3")
+            make_processor(max_retries="3")
 
     def test_accepts_positive_max_retries(self):
-        assert TransactionProcessor(max_retries=1) is not None
+        assert make_processor(max_retries=1) is not None
 
     def test_rejects_negative_external_transfer_fee_rate(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(external_transfer_fee_rate=Decimal("-0.01"))
+            make_processor(external_transfer_fee_rate=Decimal("-0.01"))
 
     def test_accepts_zero_external_transfer_fee_rate(self):
-        processor = TransactionProcessor(
+        processor = make_processor(
             external_transfer_fee_rate=Decimal("0")
         )
         assert processor is not None
 
     def test_rejects_negative_exchange_rate(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(
+            make_processor(
                 exchange_rates={(Currency.RUB, Currency.USD): Decimal("-0.01")}
             )
 
     def test_rejects_zero_exchange_rate(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor(
+            make_processor(
                 exchange_rates={(Currency.RUB, Currency.USD): Decimal("0")}
             )
 
     def test_accepts_positive_exchange_rate(self):
-        processor = TransactionProcessor(
+        processor = make_processor(
             exchange_rates={(Currency.RUB, Currency.USD): Decimal("0.01")}
         )
         assert processor is not None
@@ -102,7 +117,7 @@ class TestConstruction:
 class TestProcessRejectsNonTransaction:
     def test_rejects_non_transaction(self):
         with pytest.raises(InvalidOperationError):
-            TransactionProcessor().process(object())
+            make_processor().process(object())
 
     def test_reprocessing_a_completed_transaction_raises_uncaught(
         self, account: BankAccount
@@ -118,7 +133,7 @@ class TestProcessRejectsNonTransaction:
             amount=Decimal("10"),
             receiver=account,
         )
-        processor = TransactionProcessor()
+        processor = make_processor()
         processor.process(tx)
         assert tx.status.value == "completed"
         with pytest.raises(InvalidOperationError):
@@ -140,7 +155,7 @@ class TestProcessRejectsNonTransaction:
             scheduled_at=now + timedelta(hours=1),
             created_at=now,
         )
-        processor = TransactionProcessor(clock=lambda: now)
+        processor = make_processor(clock=lambda: now)
         with pytest.raises(InvalidOperationError):
             processor.process(tx)
         assert tx.status.value == "scheduled"
@@ -157,7 +172,7 @@ class TestProcessRejectsNonTransaction:
             scheduled_at=now,
             created_at=now,
         )
-        processor = TransactionProcessor(clock=lambda: now)
+        processor = make_processor(clock=lambda: now)
         processor.process(tx)
         assert tx.status.value == "completed"
         assert account.balance == Decimal("110")
@@ -170,7 +185,7 @@ class TestDeposit:
             amount=Decimal("50"),
             receiver=account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
         assert account.balance == Decimal("150")
         assert tx.fee == Decimal("0")
@@ -182,7 +197,7 @@ class TestDeposit:
             amount=Decimal("50"),
             receiver=account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
         assert "frozen" in tx.failure_reason
         assert tx.attempts == 1
@@ -195,7 +210,7 @@ class TestWithdrawal:
             amount=Decimal("30"),
             sender=account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
         assert account.balance == Decimal("70")
         assert tx.fee == Decimal("0")
@@ -212,7 +227,7 @@ class TestWithdrawal:
             amount=Decimal("30"),
             sender=premium_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
         assert premium_account.balance == Decimal("960")
         assert tx.fee == Decimal("10")
@@ -223,7 +238,7 @@ class TestWithdrawal:
             amount=Decimal("1000"),
             sender=account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
         assert "Insufficient funds" in tx.failure_reason
         assert tx.attempts == 1
@@ -239,7 +254,7 @@ class TestTransfer:
             sender=account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
         assert tx.fee == Decimal("0")
         assert account.balance == Decimal("60")
@@ -254,7 +269,7 @@ class TestTransfer:
             sender=account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
         assert account.balance == Decimal("100")
 
@@ -268,7 +283,7 @@ class TestTransfer:
             sender=account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
         assert account.balance == Decimal("100")
 
@@ -287,7 +302,7 @@ class TestTransfer:
             sender=premium_account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
         assert premium_account.balance == balance_before
 
@@ -305,7 +320,7 @@ class TestTransfer:
             sender=account,
             receiver=other_account,
         )
-        TransactionProcessor(max_retries=3).process(tx)
+        make_processor(max_retries=3).process(tx)
         assert tx.status.value == "failed"
         assert tx.attempts == 1
         assert "Refund to" in tx.failure_reason
@@ -319,7 +334,7 @@ class TestTransfer:
             sender=premium_account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
         # premium_account fixture also charges a fixed transaction_fee
         # of 10 on top of the withdrawn amount: 1000 - 1200 - 10 = -210
@@ -334,7 +349,7 @@ class TestExternalTransfer:
     def test_charges_fee_and_credits_full_amount(
         self, account: BankAccount, other_account: BankAccount
     ):
-        processor = TransactionProcessor(
+        processor = make_processor(
             external_transfer_fee_rate=Decimal("0.1")
         )
         tx = Transaction(
@@ -352,7 +367,7 @@ class TestExternalTransfer:
     def test_internal_transfer_has_no_fee_but_external_does(
         self, account: BankAccount, other_account: BankAccount
     ):
-        processor = TransactionProcessor(
+        processor = make_processor(
             external_transfer_fee_rate=Decimal("0.1")
         )
         internal = Transaction(
@@ -375,7 +390,7 @@ class TestExternalTransfer:
         # tx.fee reflects that full 14 (4 processor + 10 account),
         # not just the processor's own cut, so the transaction's own
         # data stays truthful about what was actually charged.
-        processor = TransactionProcessor(
+        processor = make_processor(
             external_transfer_fee_rate=Decimal("0.1")
         )
         tx = Transaction(
@@ -395,7 +410,7 @@ class TestCurrencyConversion:
     def test_converts_amount_into_receiver_currency(
         self, account: BankAccount, usd_account: BankAccount
     ):
-        processor = TransactionProcessor(
+        processor = make_processor(
             exchange_rates={(Currency.RUB, Currency.USD): Decimal("0.01")}
         )
         tx = Transaction(
@@ -409,10 +424,60 @@ class TestCurrencyConversion:
         assert tx.status.value == "completed"
         assert usd_account.balance == Decimal("101.00")
 
+    def test_credited_amount_reflects_converted_value(
+        self, account: BankAccount, usd_account: BankAccount
+    ):
+        processor = make_processor(
+            exchange_rates={(Currency.RUB, Currency.USD): Decimal("0.011")}
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("100"),
+            currency=Currency.RUB,
+            sender=account,
+            receiver=usd_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        # tx.amount stays 100 (RUB, sender's currency); the amount
+        # actually credited to the USD receiver is what was converted
+        assert tx.amount == Decimal("100")
+        assert tx.credited_amount == Decimal("1.100")
+
+    def test_credited_amount_is_none_for_withdrawal(
+        self, account: BankAccount
+    ):
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("10"),
+            sender=account,
+        )
+        make_processor().process(tx)
+        assert tx.status.value == "completed"
+        assert tx.credited_amount is None
+
+    def test_credited_amount_stays_none_when_deposit_fails(
+        self, account: BankAccount, usd_account: BankAccount
+    ):
+        usd_account.freeze()
+        processor = make_processor(
+            exchange_rates={(Currency.RUB, Currency.USD): Decimal("0.01")}
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            currency=Currency.RUB,
+            sender=account,
+            receiver=usd_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "failed"
+        assert tx.credited_amount is None
+
     def test_missing_rate_fails_transaction(
         self, account: BankAccount, usd_account: BankAccount
     ):
-        processor = TransactionProcessor(exchange_rates={})
+        processor = make_processor(exchange_rates={})
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("100"),
@@ -425,12 +490,12 @@ class TestCurrencyConversion:
         assert account.balance == Decimal("100")
 
     def test_convert_raises_directly_without_rate(self):
-        processor = TransactionProcessor()
+        processor = make_processor()
         with pytest.raises(ExchangeRateNotFoundError):
             processor.convert(Decimal("10"), Currency.RUB, Currency.USD)
 
     def test_convert_same_currency_is_identity(self):
-        processor = TransactionProcessor()
+        processor = make_processor()
         result = processor.convert(Decimal("10"), Currency.RUB, Currency.RUB)
         assert result == Decimal("10")
 
@@ -443,7 +508,7 @@ class TestRetries:
             amount=Decimal("10"),
             receiver=account,
         )
-        TransactionProcessor(max_retries=3).process(tx)
+        make_processor(max_retries=3).process(tx)
         assert tx.status.value == "completed"
         assert tx.attempts == 3
         assert account.balance == Decimal("110")
@@ -455,7 +520,7 @@ class TestRetries:
             amount=Decimal("10"),
             receiver=account,
         )
-        TransactionProcessor(max_retries=3).process(tx)
+        make_processor(max_retries=3).process(tx)
         assert tx.status.value == "failed"
         assert tx.attempts == 3
         assert "Failed after 3 attempts" in tx.failure_reason
@@ -469,7 +534,7 @@ class TestRetries:
             amount=Decimal("1000"),
             sender=account,
         )
-        TransactionProcessor(max_retries=3).process(tx)
+        make_processor(max_retries=3).process(tx)
         assert tx.status.value == "failed"
         assert tx.attempts == 1
 
@@ -492,7 +557,7 @@ class TestProcessQueue:
         )
         queue.enqueue(deposit)
         queue.enqueue(transfer)
-        processed = TransactionProcessor().process_queue(queue)
+        processed = make_processor().process_queue(queue)
         assert len(processed) == 2
         assert all(tx.status.value == "completed" for tx in processed)
         assert len(queue) == 0
@@ -507,13 +572,13 @@ class TestProcessQueue:
                     receiver=account,
                 )
             )
-        processed = TransactionProcessor().process_queue(queue, limit=2)
+        processed = make_processor().process_queue(queue, limit=2)
         assert len(processed) == 2
         assert len(queue) == 1
 
     def test_empty_queue_returns_empty_list(self):
         queue = TransactionQueue()
-        assert TransactionProcessor().process_queue(queue) == []
+        assert make_processor().process_queue(queue) == []
 
 
 class TestRiskAnalyzerIntegration:
@@ -523,7 +588,7 @@ class TestRiskAnalyzerIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        processor = make_processor(risk_analyzer=risk_analyzer)
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("60"),
@@ -542,7 +607,7 @@ class TestRiskAnalyzerIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        processor = make_processor(risk_analyzer=risk_analyzer)
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("60"),
@@ -558,7 +623,7 @@ class TestRiskAnalyzerIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        processor = make_processor(risk_analyzer=risk_analyzer)
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("10"),
@@ -574,7 +639,7 @@ class TestRiskAnalyzerIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        processor = make_processor(risk_analyzer=risk_analyzer)
         # first transfer to other_account is a new recipient: exactly
         # one risk factor, MEDIUM, must still go through
         tx = Transaction(
@@ -586,18 +651,25 @@ class TestRiskAnalyzerIntegration:
         processor.process(tx)
         assert tx.status.value == "completed"
 
-    def test_no_risk_analyzer_preserves_default_behavior(
+    def test_no_explicit_risk_analyzer_still_blocks_high_risk_transaction(
         self, account: BankAccount, other_account: BankAccount
     ):
+        # Regression test: TransactionProcessor() with no explicit
+        # risk_analyzer must still construct a default RiskAnalyzer
+        # and use it - there is no constructor path that skips risk
+        # checking entirely. large_amount + new_recipient (first
+        # transfer between these accounts) is HIGH under default
+        # thresholds.
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("1000000"),
             sender=account,
             receiver=other_account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "failed"
-        assert "Blocked by risk analysis" not in tx.failure_reason
+        assert "Blocked by risk analysis" in tx.failure_reason
+        assert account.balance == Decimal("100")
 
     def test_resubmitting_a_blocked_transfer_is_blocked_again(
         self, account: BankAccount, other_account: BankAccount
@@ -611,7 +683,7 @@ class TestRiskAnalyzerIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        processor = make_processor(risk_analyzer=risk_analyzer)
         first = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("60"),
@@ -634,12 +706,100 @@ class TestRiskAnalyzerIntegration:
         assert other_account.balance == Decimal("500")
 
 
+class TestBankHookSuppression:
+    def test_shared_risk_analyzer_is_assessed_only_once(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        # Regression test: when the sender account was opened through
+        # a Bank whose before_withdraw hook assesses risk with the
+        # SAME RiskAnalyzer instance the processor uses (the exact
+        # configuration demos/day6_demo.py wires up), one processed
+        # transaction must record exactly one operation in the
+        # analyzer's frequency history - not two.
+        risk_analyzer = RiskAnalyzer(clock=lambda: DAY_TIME)
+        account._bind_bank_hooks(
+            before_operation=lambda: None,
+            after_withdraw=lambda amount: None,
+            before_withdraw=lambda amount: risk_analyzer.assess(
+                Transaction(
+                    type=TransactionType.WITHDRAWAL,
+                    amount=amount,
+                    sender=account,
+                )
+            ),
+        )
+        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=account,
+            receiver=other_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        assert (
+            len(risk_analyzer._recent_operations[account.account_id]) == 1
+        )
+
+    def test_hook_suppressed_only_during_processor_driven_withdraw(
+        self, account: BankAccount
+    ):
+        # The suppression must be scoped to exactly the processor's
+        # own internal withdraw() call - a direct account.withdraw()
+        # made afterward must still trigger the hook normally.
+        calls = {"n": 0}
+        account._bind_bank_hooks(
+            before_operation=lambda: None,
+            after_withdraw=lambda amount: None,
+            before_withdraw=lambda amount: calls.__setitem__(
+                "n", calls["n"] + 1
+            ),
+        )
+        processor = make_processor()
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("10"),
+            sender=account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        assert calls["n"] == 0
+
+        account.withdraw(Decimal("5"))
+        assert calls["n"] == 1
+
+    def test_hook_restored_even_when_withdraw_fails(
+        self, account: BankAccount
+    ):
+        calls = {"n": 0}
+        account._bind_bank_hooks(
+            before_operation=lambda: None,
+            after_withdraw=lambda amount: None,
+            before_withdraw=lambda amount: calls.__setitem__(
+                "n", calls["n"] + 1
+            ),
+        )
+        processor = make_processor()
+        tx = Transaction(
+            type=TransactionType.WITHDRAWAL,
+            amount=Decimal("1000"),
+            sender=account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "failed"
+        assert calls["n"] == 0
+
+        with pytest.raises(InsufficientFundsError):
+            account.withdraw(Decimal("1000"))
+        assert calls["n"] == 1
+
+
 class TestAuditLogIntegration:
     def test_logs_one_entry_per_processed_transaction(
         self, account: BankAccount, other_account: BankAccount
     ):
         audit_log = AuditLog(clock=lambda: DAY_TIME)
-        processor = TransactionProcessor(audit_log=audit_log)
+        processor = make_processor(audit_log=audit_log)
         tx = Transaction(
             type=TransactionType.TRANSFER,
             amount=Decimal("10"),
@@ -660,7 +820,7 @@ class TestAuditLogIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("50"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(
+        processor = make_processor(
             risk_analyzer=risk_analyzer, audit_log=audit_log
         )
         tx = Transaction(
@@ -679,7 +839,7 @@ class TestAuditLogIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(
+        processor = make_processor(
             risk_analyzer=risk_analyzer, audit_log=audit_log
         )
         tx = Transaction(
@@ -698,7 +858,7 @@ class TestAuditLogIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(
+        processor = make_processor(
             risk_analyzer=risk_analyzer, audit_log=audit_log
         )
         # prime the recipient as known first so the real assertion
@@ -722,7 +882,7 @@ class TestAuditLogIntegration:
 
     def test_non_risk_failure_logged_as_warning(self, account: BankAccount):
         audit_log = AuditLog(clock=lambda: DAY_TIME)
-        processor = TransactionProcessor(audit_log=audit_log)
+        processor = make_processor(audit_log=audit_log)
         tx = Transaction(
             type=TransactionType.WITHDRAWAL,
             amount=Decimal("1000"),
@@ -739,7 +899,7 @@ class TestAuditLogIntegration:
             amount=Decimal("10"),
             receiver=account,
         )
-        TransactionProcessor().process(tx)
+        make_processor().process(tx)
         assert tx.status.value == "completed"
 
     def test_audit_write_failure_does_not_crash_a_completed_transaction(
@@ -752,7 +912,7 @@ class TestAuditLogIntegration:
         broken_path = tmp_path / "not_a_file"
         broken_path.mkdir()
         audit_log = AuditLog(file_path=broken_path, clock=lambda: DAY_TIME)
-        processor = TransactionProcessor(audit_log=audit_log)
+        processor = make_processor(audit_log=audit_log)
         tx = Transaction(
             type=TransactionType.DEPOSIT,
             amount=Decimal("10"),
@@ -770,7 +930,7 @@ class TestAuditLogIntegration:
         # not show up as a "suspicious operation" just because it
         # failed and got WARNING severity.
         audit_log = AuditLog(clock=lambda: DAY_TIME)
-        processor = TransactionProcessor(audit_log=audit_log)
+        processor = make_processor(audit_log=audit_log)
         tx = Transaction(
             type=TransactionType.WITHDRAWAL,
             amount=Decimal("1000"),
@@ -784,7 +944,7 @@ class TestAuditLogIntegration:
         self, account: BankAccount
     ):
         audit_log = AuditLog(clock=lambda: DAY_TIME)
-        processor = TransactionProcessor(audit_log=audit_log)
+        processor = make_processor(audit_log=audit_log)
         tx = Transaction(
             type=TransactionType.WITHDRAWAL,
             amount=Decimal("1000"),
@@ -802,7 +962,7 @@ class TestAuditLogIntegration:
         risk_analyzer = RiskAnalyzer(
             large_amount_threshold=Decimal("1000000"), clock=lambda: DAY_TIME
         )
-        processor = TransactionProcessor(
+        processor = make_processor(
             risk_analyzer=risk_analyzer, audit_log=audit_log
         )
         tx = Transaction(

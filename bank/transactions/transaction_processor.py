@@ -64,9 +64,12 @@ class TransactionProcessor:
             retry instead of immediately failing the transaction
         :param clock: callable returning the current datetime, used
             to stamp completion/failure times
-        :param risk_analyzer: optional analyzer consulted before
-            each transaction; HIGH-risk transactions are blocked
-            before any account is touched
+        :param risk_analyzer: analyzer consulted before each
+            transaction; HIGH-risk transactions are blocked before
+            any account is touched. Risk analysis cannot be turned
+            off - if None, a RiskAnalyzer with default thresholds is
+            created instead, so every processor always checks risk;
+            pass an explicit instance to tune the thresholds
         :param audit_log: optional log that records one entry per
             processed transaction's final outcome
         """
@@ -89,7 +92,11 @@ class TransactionProcessor:
         self._max_retries = max_retries
         self._retryable_errors = retryable_errors
         self._clock = clock
-        self._risk_analyzer = risk_analyzer
+        self._risk_analyzer = (
+            risk_analyzer
+            if risk_analyzer is not None
+            else RiskAnalyzer(clock=clock)
+        )
         self._audit_log = audit_log
         self._handlers: dict[TransactionType, _Handler] = {
             TransactionType.DEPOSIT: self._execute_deposit,
@@ -134,6 +141,7 @@ class TransactionProcessor:
         )
         receiver.deposit(credited)
         transaction._set_fee(Decimal("0"))
+        transaction._set_credited_amount(credited)
 
     def _execute_withdrawal(self, transaction: Transaction) -> None:
         """
@@ -144,12 +152,20 @@ class TransactionProcessor:
         transaction fee), measured from the actual balance change
         rather than assumed to be zero.
 
+        The sender's before_withdraw hook (a bank-level risk check,
+        if the account was opened through a Bank) is suppressed for
+        this call: process() already ran risk analysis for this exact
+        transaction above with full context, so letting the hook run
+        again would double-count it and could block on a cruder,
+        less-informed reassessment of a transaction already cleared.
+
         :param transaction: WITHDRAWAL transaction to execute
         :return: None
         """
         sender = transaction.sender
         balance_before = sender.balance
-        sender.withdraw(transaction.amount)
+        with sender._suppress_before_withdraw_hook():
+            sender.withdraw(transaction.amount)
         actual_debited = balance_before - sender.balance
         transaction._set_fee(actual_debited - transaction.amount)
 
@@ -189,6 +205,9 @@ class TransactionProcessor:
         own on top of what withdraw() was asked for. If the
         receiver's deposit fails after the sender was already
         debited, the debit is refunded so no funds are destroyed.
+        The sender's before_withdraw hook is suppressed for the same
+        reason as in _execute_withdrawal - process() already ran risk
+        analysis for this transaction.
 
         :param transaction: transaction being executed
         :param processor_fee: fee this processor adds to the
@@ -203,7 +222,8 @@ class TransactionProcessor:
             transaction.amount, transaction.currency, receiver.currency
         )
         balance_before = sender.balance
-        sender.withdraw(debit_amount)
+        with sender._suppress_before_withdraw_hook():
+            sender.withdraw(debit_amount)
         actual_debited = balance_before - sender.balance
         try:
             receiver.deposit(credited)
@@ -212,6 +232,7 @@ class TransactionProcessor:
                 transaction, sender, actual_debited, deposit_error
             )
         transaction._set_fee(actual_debited - transaction.amount)
+        transaction._set_credited_amount(credited)
 
     @staticmethod
     def _refund_or_raise(
@@ -257,11 +278,11 @@ class TransactionProcessor:
     def process(self, transaction: Transaction) -> None:
         """
         Process a single transaction, retrying on transient errors
-        up to the configured limit before marking it failed. If a
-        RiskAnalyzer is configured and assesses the transaction as
-        HIGH risk, it is blocked before any account is touched.
-        Every outcome (blocked, completed, or failed) is recorded
-        to the configured AuditLog, if any.
+        up to the configured limit before marking it failed. Risk
+        analysis always runs first (see __init__); a HIGH-risk
+        transaction is blocked before any account is touched. Every
+        outcome (blocked, completed, or failed) is recorded to the
+        configured AuditLog, if any.
 
         :param transaction: transaction to process; must be PENDING,
             or SCHEDULED with `scheduled_at` already due
@@ -282,12 +303,8 @@ class TransactionProcessor:
                 f"has not yet arrived"
             )
 
-        assessment = (
-            self._risk_analyzer.assess(transaction)
-            if self._risk_analyzer is not None
-            else None
-        )
-        if assessment is not None and assessment.level == RiskLevel.HIGH:
+        assessment = self._risk_analyzer.assess(transaction)
+        if assessment.level == RiskLevel.HIGH:
             transaction.mark_processing()
             transaction.mark_failed(
                 f"Blocked by risk analysis: {', '.join(assessment.reasons)}",
@@ -351,7 +368,7 @@ class TransactionProcessor:
         self._log_outcome(transaction, assessment)
 
     def _log_outcome(
-        self, transaction: Transaction, assessment: RiskAssessment | None
+        self, transaction: Transaction, assessment: RiskAssessment
     ) -> None:
         """
         Record one audit entry for a transaction's final outcome, if
@@ -365,7 +382,7 @@ class TransactionProcessor:
         :param transaction: transaction that just reached a
             terminal status (COMPLETED or FAILED)
         :param assessment: the risk assessment made for this
-            transaction, if a RiskAnalyzer was configured
+            transaction
         :return: None
         """
         if self._audit_log is None:
@@ -385,10 +402,8 @@ class TransactionProcessor:
                     "success": (
                         transaction.status == TransactionStatus.COMPLETED
                     ),
-                    "risk_level": (
-                        assessment.level.value if assessment else None
-                    ),
-                    "risk_reasons": (assessment.reasons if assessment else []),
+                    "risk_level": assessment.level.value,
+                    "risk_reasons": assessment.reasons,
                     "amount": transaction.amount,
                     "fee": transaction.fee,
                 },
@@ -405,7 +420,7 @@ class TransactionProcessor:
 
     @staticmethod
     def _severity_for(
-        transaction: Transaction, assessment: RiskAssessment | None
+        transaction: Transaction, assessment: RiskAssessment
     ) -> AuditSeverity:
         """
         Derive an audit severity from a transaction's outcome and
@@ -413,16 +428,15 @@ class TransactionProcessor:
 
         :param transaction: transaction that reached a terminal
             status
-        :param assessment: risk assessment made for this
-            transaction, if any
+        :param assessment: risk assessment made for this transaction
         :return: CRITICAL if blocked/high risk, WARNING if failed or
             medium risk, INFO otherwise
         """
-        if assessment is not None and assessment.level == RiskLevel.HIGH:
+        if assessment.level == RiskLevel.HIGH:
             return AuditSeverity.CRITICAL
         if transaction.status == TransactionStatus.FAILED:
             return AuditSeverity.WARNING
-        if assessment is not None and assessment.level == RiskLevel.MEDIUM:
+        if assessment.level == RiskLevel.MEDIUM:
             return AuditSeverity.WARNING
         return AuditSeverity.INFO
 

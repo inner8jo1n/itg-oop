@@ -37,18 +37,19 @@ def build_bank() -> tuple[Bank, AuditLog, TransactionProcessor, dict, list]:
         frequent_operations_threshold=4,
         clock=lambda: DAY_TIME,
     )
-    # Bank is NOT given risk_analyzer here: every transaction in this
-    # demo flows through TransactionProcessor, which already assesses
-    # risk once per transaction. Bank-opened accounts also carry a
-    # before_withdraw hook (see Bank.open_account) that would assess
-    # risk again on every sender-side operation if Bank had its own
-    # risk_analyzer - correct when transactions go through
-    # Bank.withdraw_from_account() directly (never used here), but a
-    # redundant second assessment (and a second frequency-tracking
-    # hit) for transactions already assessed by the processor.
+    # Bank and TransactionProcessor share one risk_analyzer: every
+    # transaction here flows through the processor, which assesses
+    # risk once with full transaction context and suppresses the
+    # sender account's before_withdraw hook (see
+    # AbstractAccount._suppress_before_withdraw_hook) for the
+    # duration of its own withdraw() call, so Bank's hook never
+    # re-assesses the same operation. The hook still protects any
+    # withdrawal made through Bank.withdraw_from_account() or
+    # directly on the account, outside the processor.
     bank = Bank(
         name="Day7 Demo Bank",
         clock=lambda: DAY_TIME,
+        risk_analyzer=risk_analyzer,
         audit_log=audit_log,
     )
     processor = TransactionProcessor(

@@ -137,8 +137,16 @@ class TestRiskReport:
         assert report.summary["total_audit_entries"] == 1
         assert "error_statistics" in report.summary
 
-    def test_empty_when_nothing_suspicious(self, report_setup):
-        report = report_setup["builder"].risk_report()
+    def test_empty_when_nothing_happened(self):
+        # report_setup's one transaction is a first-ever transfer
+        # between two fresh accounts, so it is always flagged
+        # new_recipient under the now-mandatory default risk
+        # analysis (see TransactionProcessor/Bank: risk_analyzer
+        # can no longer be turned off). A genuinely empty risk
+        # report needs a bank with no processed transactions at all.
+        bank, audit_log, *_ = make_bank_with_clients()
+        builder = ReportBuilder(bank, audit_log, clock=lambda: DAY_TIME)
+        report = builder.risk_report()
         assert report.rows == []
 
 
@@ -162,10 +170,12 @@ class TestExport:
         assert lines[0] == "rank,client,total_balance"
         assert len(lines) == 1 + len(report.rows)
 
-    def test_export_to_csv_with_empty_rows_still_writes_header(
-        self, report_setup, tmp_path
-    ):
-        report = report_setup["builder"].risk_report()
+    def test_export_to_csv_with_empty_rows_still_writes_header(self, tmp_path):
+        # see TestRiskReport.test_empty_when_nothing_happened for
+        # why this needs a bank with no processed transactions
+        bank, audit_log, *_ = make_bank_with_clients()
+        builder = ReportBuilder(bank, audit_log, clock=lambda: DAY_TIME)
+        report = builder.risk_report()
         path = ReportBuilder.export_to_csv(report, tmp_path / "risk.csv")
         lines = path.read_text(encoding="utf-8").splitlines()
         assert lines == [",".join(report.fieldnames)]
@@ -210,6 +220,41 @@ class TestCharts:
             report_setup["anna_account"], [report_setup["tx"]]
         )
         assert balances == [Decimal("100000"), Decimal("95000")]
+        assert len(timestamps) == 2
+
+    def test_balance_history_uses_credited_amount_for_cross_currency(self):
+        # Regression test: a receiver's balance history must use the
+        # amount actually credited (post-conversion), not the raw
+        # tx.amount which is denominated in the sender's currency.
+        # 30000 RUB at a 0.011 rate credits 330 USD, not 30000.
+        bank, audit_log, anna, oleg, anna_account, _ = (
+            make_bank_with_clients()
+        )
+        oleg_usd_account = bank.open_account(
+            oleg.client_id,
+            currency=Currency.USD,
+            initial_balance=Decimal("50"),
+        )
+        processor = TransactionProcessor(
+            exchange_rates={(Currency.RUB, Currency.USD): Decimal("0.011")},
+            audit_log=audit_log,
+            clock=lambda: DAY_TIME,
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("30000"),
+            currency=Currency.RUB,
+            sender=anna_account,
+            receiver=oleg_usd_account,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+
+        builder = ReportBuilder(bank, audit_log, clock=lambda: DAY_TIME)
+        timestamps, balances = builder._reconstruct_balance_history(
+            oleg_usd_account, [tx]
+        )
+        assert balances == [Decimal("50"), Decimal("380.000")]
         assert len(timestamps) == 2
 
 

@@ -306,13 +306,12 @@ class ReportBuilder:
         """
         Reconstruct an account's balance at each of its completed
         transactions, working backward from its current (always
-        authoritative) balance. Cross-currency credits are treated
-        as if no conversion happened (the transaction's raw amount
-        is used), since the exact converted amount is not retained
-        on the Transaction - this is a simplification, consistent
-        with similar ones already made elsewhere in this project
-        (e.g. Bank.get_clients_ranking() also sums currencies
-        without converting them).
+        authoritative) balance. Receiver-side deltas use
+        tx.credited_amount, the amount actually added to the
+        receiver's balance after currency conversion, rather than
+        tx.amount (which is denominated in the sender's currency and
+        would be wrong whenever sender and receiver use different
+        currencies).
 
         :param account: account to reconstruct history for
         :param transactions: transactions to search for ones
@@ -338,7 +337,8 @@ class ReportBuilder:
             if tx.sender is account:
                 deltas.append(-(tx.amount + tx.fee))
             else:
-                deltas.append(tx.amount)
+                assert tx.credited_amount is not None
+                deltas.append(tx.credited_amount)
         starting_balance = account.balance - sum(deltas, Decimal("0"))
 
         timestamps = [relevant[0].created_at]

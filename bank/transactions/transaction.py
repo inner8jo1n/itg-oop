@@ -95,6 +95,7 @@ class Transaction:
         self._amount = self._validate_amount(amount)
         self._currency = currency
         self._fee = Decimal("0")
+        self._credited_amount: Decimal | None = None
         self._sender = sender
         self._receiver = receiver
         self._failure_reason: str | None = None
@@ -217,6 +218,18 @@ class Transaction:
         return self._fee
 
     @property
+    def credited_amount(self) -> Decimal | None:
+        """
+        Get the amount actually credited to the receiver, in the
+        receiver's own currency (after conversion, if any). Set once
+        the receiver's deposit succeeds; None until then, and for
+        transaction types with no receiver.
+
+        :return: credited amount, in the receiver's currency, or None
+        """
+        return self._credited_amount
+
+    @property
     def sender(self) -> BankAccount | None:
         """
         Get the account funds are debited from, if any.
@@ -307,6 +320,18 @@ class Transaction:
         """
         self._fee = fee
 
+    def _set_credited_amount(self, credited_amount: Decimal) -> None:
+        """
+        Record the amount actually credited to the receiver, in the
+        receiver's own currency. Intended to be called by a
+        TransactionProcessor only, right after the receiver's deposit
+        succeeds.
+
+        :param credited_amount: amount credited, in receiver's currency
+        :return: None
+        """
+        self._credited_amount = credited_amount
+
     def record_attempt(self) -> None:
         """
         Record that a processing attempt has started.
@@ -394,6 +419,7 @@ class Transaction:
             "amount": self._amount,
             "currency": self._currency.value,
             "fee": self._fee,
+            "credited_amount": self._credited_amount,
             "sender": self._sender.account_id if self._sender else None,
             "receiver": self._receiver.account_id if self._receiver else None,
             "status": self._status.value,

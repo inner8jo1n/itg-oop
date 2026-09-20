@@ -26,6 +26,7 @@ class AbstractAccount(ABC):
         self._before_operation: Callable[[], None] | None = None
         self._before_withdraw: Callable[[Decimal], None] | None = None
         self._after_withdraw: Callable[[Decimal], None] | None = None
+        self._before_withdraw_suppressed = False
 
     @property
     def account_id(self) -> str:
@@ -93,12 +94,33 @@ class AbstractAccount(ABC):
         Give the bound bank hook a chance to block a withdrawal
         before any balance change, regardless of whether withdraw()
         was called through the bank or directly on this account.
+        No-op while the hook is suppressed - see
+        suppress_before_withdraw_hook.
 
         :param amount: amount about to be withdrawn, unvalidated
         :return: None
         """
-        if self._before_withdraw is not None:
+        if self._before_withdraw is not None and (
+            not self._before_withdraw_suppressed
+        ):
             self._before_withdraw(amount)
+
+    def _suppress_before_withdraw_hook(self) -> "_SuppressBeforeWithdraw":
+        """
+        Context manager that disables this account's before_withdraw
+        hook for its duration. Intended for a caller - such as
+        TransactionProcessor - that already performed its own,
+        strictly more informed risk assessment for the withdrawal
+        about to happen (it sees the full Transaction, not just a
+        bare amount) and would otherwise trigger the bank's hook a
+        second time, double-counting the operation in the risk
+        analyzer's frequency tracking and potentially logging a
+        second, conflicting audit entry. Always restores the
+        previous state on exit, including when the withdrawal raises.
+
+        :return: context manager suppressing the before_withdraw hook
+        """
+        return _SuppressBeforeWithdraw(self)
 
     def _ensure_operable(self) -> None:
         """
@@ -186,3 +208,20 @@ class AbstractAccount(ABC):
         :return: dictionary with account information
         """
         raise NotImplementedError
+
+
+class _SuppressBeforeWithdraw:
+    """
+    Context manager backing AbstractAccount._suppress_before_withdraw_hook.
+    """
+
+    def __init__(self, account: AbstractAccount):
+        self._account = account
+        self._previous = False
+
+    def __enter__(self) -> None:
+        self._previous = self._account._before_withdraw_suppressed
+        self._account._before_withdraw_suppressed = True
+
+    def __exit__(self, *exc_info) -> None:
+        self._account._before_withdraw_suppressed = self._previous
