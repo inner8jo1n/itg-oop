@@ -39,13 +39,13 @@ def build_bank() -> tuple[Bank, AuditLog, TransactionProcessor, dict, list]:
     )
     # Bank and TransactionProcessor share one risk_analyzer: every
     # transaction here flows through the processor, which assesses
-    # risk once with full transaction context and suppresses the
-    # sender account's before_withdraw hook (see
-    # AbstractAccount._suppress_before_withdraw_hook) for the
-    # duration of its own withdraw() call, so Bank's hook never
-    # re-assesses the same operation. The hook still protects any
-    # withdrawal made through Bank.withdraw_from_account() or
-    # directly on the account, outside the processor.
+    # risk once with full transaction context, then tells the sender
+    # account's before_withdraw hook that this exact analyzer already
+    # did so (see AbstractAccount._mark_before_withdraw_assessed_by),
+    # so Bank's hook recognizes it and skips its own re-assessment.
+    # The hook still fully protects any withdrawal made through
+    # Bank.withdraw_from_account() or directly on the account, since
+    # those never carry a matching assessed_by token.
     bank = Bank(
         name="Day7 Demo Bank",
         clock=lambda: DAY_TIME,

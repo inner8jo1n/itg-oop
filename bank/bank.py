@@ -241,8 +241,10 @@ class Bank:
             after_withdraw=lambda withdrawn: self._flag_if_large_withdrawal(
                 account, withdrawn
             ),
-            before_withdraw=lambda amount: self._check_withdrawal_risk(
-                account, amount
+            before_withdraw=(
+                lambda amount, assessed_by: self._check_withdrawal_risk(
+                    account, amount, assessed_by
+                )
             ),
         )
         return account
@@ -348,7 +350,9 @@ class Bank:
         )
         return self._risk_analyzer.assess(transaction)
 
-    def _check_withdrawal_risk(self, account: BankAccount, amount) -> None:
+    def _check_withdrawal_risk(
+        self, account: BankAccount, amount, assessed_by: object | None = None
+    ) -> None:
         """
         Bound as every bank-opened account's before_withdraw hook
         (see open_account), so this runs before ANY withdrawal
@@ -358,6 +362,18 @@ class Bank:
         it. Raises RiskBlockedError, flags the owning client
         suspicious and logs a CRITICAL audit entry if risk analysis
         flags the withdrawal as HIGH risk.
+
+        If `assessed_by` is this bank's own risk_analyzer instance
+        (set by a TransactionProcessor that shares it - see
+        AbstractAccount._mark_before_withdraw_assessed_by), the check
+        is skipped: the exact same policy and history already ran for
+        this operation, so re-running it would only double-count it.
+        Any other value - a different analyzer, or None, as when this
+        is reached via withdraw_from_account() or a direct
+        account.withdraw() call - means this bank's own policy has
+        not been consulted yet, so it always runs in full; a caller
+        configured with a different (or no) analyzer can never
+        silently bypass it.
 
         The resulting assessment is stashed on this bank so
         withdraw_from_account() can log an accurate success entry
@@ -369,8 +385,12 @@ class Bank:
 
         :param account: account about to be withdrawn from
         :param amount: amount about to be withdrawn
+        :param assessed_by: identity of the analyzer that already
+            assessed this withdrawal, if any
         :return: None
         """
+        if assessed_by is self._risk_analyzer:
+            return
         assessment = self._assess_withdrawal_risk(account, amount)
         self._last_withdrawal_assessment = assessment
         if assessment.level != RiskLevel.HIGH:

@@ -153,18 +153,20 @@ class TransactionProcessor:
         rather than assumed to be zero.
 
         The sender's before_withdraw hook (a bank-level risk check,
-        if the account was opened through a Bank) is suppressed for
-        this call: process() already ran risk analysis for this exact
-        transaction above with full context, so letting the hook run
-        again would double-count it and could block on a cruder,
-        less-informed reassessment of a transaction already cleared.
+        if the account was opened through a Bank) is told this
+        processor's own risk_analyzer already assessed the transaction
+        above with full context. The hook only skips its own check
+        when the bank's risk_analyzer is that exact same instance -
+        otherwise (a different or no analyzer configured on this
+        processor) the bank's own policy still runs in full, so it
+        can never be silently bypassed.
 
         :param transaction: WITHDRAWAL transaction to execute
         :return: None
         """
         sender = transaction.sender
         balance_before = sender.balance
-        with sender._suppress_before_withdraw_hook():
+        with sender._mark_before_withdraw_assessed_by(self._risk_analyzer):
             sender.withdraw(transaction.amount)
         actual_debited = balance_before - sender.balance
         transaction._set_fee(actual_debited - transaction.amount)
@@ -205,9 +207,9 @@ class TransactionProcessor:
         own on top of what withdraw() was asked for. If the
         receiver's deposit fails after the sender was already
         debited, the debit is refunded so no funds are destroyed.
-        The sender's before_withdraw hook is suppressed for the same
-        reason as in _execute_withdrawal - process() already ran risk
-        analysis for this transaction.
+        The sender's before_withdraw hook is told about this
+        processor's own risk_analyzer for the same reason as in
+        _execute_withdrawal.
 
         :param transaction: transaction being executed
         :param processor_fee: fee this processor adds to the
@@ -222,7 +224,7 @@ class TransactionProcessor:
             transaction.amount, transaction.currency, receiver.currency
         )
         balance_before = sender.balance
-        with sender._suppress_before_withdraw_hook():
+        with sender._mark_before_withdraw_assessed_by(self._risk_analyzer):
             sender.withdraw(debit_amount)
         actual_debited = balance_before - sender.balance
         try:

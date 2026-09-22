@@ -5,6 +5,8 @@ from decimal import Decimal
 from bank.enums import AccountStatus
 from bank.exceptions import AccountClosedError, AccountFrozenError
 
+_BeforeWithdrawHook = Callable[[Decimal, object | None], None]
+
 
 class AbstractAccount(ABC):
     """
@@ -24,9 +26,9 @@ class AbstractAccount(ABC):
         self._balance = initial_balance
         self._status = AccountStatus.ACTIVE
         self._before_operation: Callable[[], None] | None = None
-        self._before_withdraw: Callable[[Decimal], None] | None = None
+        self._before_withdraw: _BeforeWithdrawHook | None = None
         self._after_withdraw: Callable[[Decimal], None] | None = None
-        self._before_withdraw_suppressed = False
+        self._before_withdraw_assessed_by: object | None = None
 
     @property
     def account_id(self) -> str:
@@ -68,7 +70,7 @@ class AbstractAccount(ABC):
         self,
         before_operation: Callable[[], None],
         after_withdraw: Callable[[Decimal], None],
-        before_withdraw: Callable[[Decimal], None] | None = None,
+        before_withdraw: _BeforeWithdrawHook | None = None,
     ) -> None:
         """
         Attach the bank-level checks that every mutating operation on
@@ -80,9 +82,10 @@ class AbstractAccount(ABC):
         :param after_withdraw: called with the amount debited after
             each successful withdrawal, to flag suspicious activity
         :param before_withdraw: called with the requested (not yet
-            validated) amount before a withdrawal changes the
-            balance; may raise to block the withdrawal entirely,
-            e.g. based on risk analysis
+            validated) amount and an opaque "assessed_by" token (see
+            _mark_before_withdraw_assessed_by) before a withdrawal
+            changes the balance; may raise to block the withdrawal
+            entirely, e.g. based on risk analysis
         :return: None
         """
         self._before_operation = before_operation
@@ -93,34 +96,42 @@ class AbstractAccount(ABC):
         """
         Give the bound bank hook a chance to block a withdrawal
         before any balance change, regardless of whether withdraw()
-        was called through the bank or directly on this account.
-        No-op while the hook is suppressed - see
-        suppress_before_withdraw_hook.
+        was called through the bank or directly on this account. The
+        hook itself decides whether the current assessed_by token (see
+        _mark_before_withdraw_assessed_by) means it can trust an
+        assessment already done elsewhere - this method never
+        silences the hook on its own.
 
         :param amount: amount about to be withdrawn, unvalidated
         :return: None
         """
-        if self._before_withdraw is not None and (
-            not self._before_withdraw_suppressed
-        ):
-            self._before_withdraw(amount)
+        if self._before_withdraw is not None:
+            self._before_withdraw(amount, self._before_withdraw_assessed_by)
 
-    def _suppress_before_withdraw_hook(self) -> "_SuppressBeforeWithdraw":
+    def _mark_before_withdraw_assessed_by(
+        self, risk_analyzer: object
+    ) -> "_AssessedByMarker":
         """
-        Context manager that disables this account's before_withdraw
-        hook for its duration. Intended for a caller - such as
-        TransactionProcessor - that already performed its own,
-        strictly more informed risk assessment for the withdrawal
-        about to happen (it sees the full Transaction, not just a
-        bare amount) and would otherwise trigger the bank's hook a
-        second time, double-counting the operation in the risk
-        analyzer's frequency tracking and potentially logging a
-        second, conflicting audit entry. Always restores the
-        previous state on exit, including when the withdrawal raises.
+        Context manager that tags this account's next before_withdraw
+        call as already assessed by `risk_analyzer`. Intended for a
+        caller - such as TransactionProcessor - that already performed
+        its own risk assessment for the withdrawal about to happen.
 
-        :return: context manager suppressing the before_withdraw hook
+        This does NOT unconditionally silence the bank's hook: it only
+        passes `risk_analyzer`'s identity through to it. The bound
+        hook (see Bank._check_withdrawal_risk) treats this as
+        sufficient only when its own risk_analyzer IS that exact same
+        instance - otherwise it still runs its own check in full, so
+        a caller configured with a different (or no) analyzer can
+        never silently bypass the bank's own risk policy. Always
+        restores the previous token on exit, including when the
+        withdrawal raises.
+
+        :param risk_analyzer: the analyzer instance that already
+            assessed this withdrawal
+        :return: context manager applying the assessed_by token
         """
-        return _SuppressBeforeWithdraw(self)
+        return _AssessedByMarker(self, risk_analyzer)
 
     def _ensure_operable(self) -> None:
         """
@@ -210,18 +221,20 @@ class AbstractAccount(ABC):
         raise NotImplementedError
 
 
-class _SuppressBeforeWithdraw:
+class _AssessedByMarker:
     """
-    Context manager backing AbstractAccount._suppress_before_withdraw_hook.
+    Context manager backing
+    AbstractAccount._mark_before_withdraw_assessed_by.
     """
 
-    def __init__(self, account: AbstractAccount):
+    def __init__(self, account: AbstractAccount, risk_analyzer: object):
         self._account = account
-        self._previous = False
+        self._risk_analyzer = risk_analyzer
+        self._previous: object | None = None
 
     def __enter__(self) -> None:
-        self._previous = self._account._before_withdraw_suppressed
-        self._account._before_withdraw_suppressed = True
+        self._previous = self._account._before_withdraw_assessed_by
+        self._account._before_withdraw_assessed_by = self._risk_analyzer
 
     def __exit__(self, *exc_info) -> None:
-        self._account._before_withdraw_suppressed = self._previous
+        self._account._before_withdraw_assessed_by = self._previous

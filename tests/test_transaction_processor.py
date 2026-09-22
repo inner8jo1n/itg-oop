@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -7,6 +7,7 @@ from bank.accounts.bank_account import BankAccount
 from bank.accounts.premium_account import PremiumAccount
 from bank.audit.audit_log import AuditLog
 from bank.audit.risk_analyzer import RiskAnalyzer
+from bank.bank import Bank
 from bank.enums import AuditSeverity, Currency, TransactionType
 from bank.exceptions import (
     ExchangeRateNotFoundError,
@@ -706,56 +707,26 @@ class TestRiskAnalyzerIntegration:
         assert other_account.balance == Decimal("500")
 
 
-class TestBankHookSuppression:
-    def test_shared_risk_analyzer_is_assessed_only_once(
-        self, account: BankAccount, other_account: BankAccount
-    ):
-        # Regression test: when the sender account was opened through
-        # a Bank whose before_withdraw hook assesses risk with the
-        # SAME RiskAnalyzer instance the processor uses (the exact
-        # configuration demos/day6_demo.py wires up), one processed
-        # transaction must record exactly one operation in the
-        # analyzer's frequency history - not two.
-        risk_analyzer = RiskAnalyzer(clock=lambda: DAY_TIME)
-        account._bind_bank_hooks(
-            before_operation=lambda: None,
-            after_withdraw=lambda amount: None,
-            before_withdraw=lambda amount: risk_analyzer.assess(
-                Transaction(
-                    type=TransactionType.WITHDRAWAL,
-                    amount=amount,
-                    sender=account,
-                )
-            ),
-        )
-        processor = TransactionProcessor(risk_analyzer=risk_analyzer)
-        tx = Transaction(
-            type=TransactionType.TRANSFER,
-            amount=Decimal("10"),
-            sender=account,
-            receiver=other_account,
-        )
-        processor.process(tx)
-        assert tx.status.value == "completed"
-        assert (
-            len(risk_analyzer._recent_operations[account.account_id]) == 1
-        )
-
-    def test_hook_suppressed_only_during_processor_driven_withdraw(
+class TestBankHookAssessedBy:
+    def test_hook_always_runs_and_receives_the_assessed_by_token(
         self, account: BankAccount
     ):
-        # The suppression must be scoped to exactly the processor's
-        # own internal withdraw() call - a direct account.withdraw()
-        # made afterward must still trigger the hook normally.
-        calls = {"n": 0}
+        # The before_withdraw hook is never unconditionally silenced:
+        # it always runs, and is told which analyzer (if any) already
+        # assessed this withdrawal, so it alone decides whether that
+        # is good enough to skip its own check.
+        seen = []
         account._bind_bank_hooks(
             before_operation=lambda: None,
             after_withdraw=lambda amount: None,
-            before_withdraw=lambda amount: calls.__setitem__(
-                "n", calls["n"] + 1
+            before_withdraw=lambda amount, assessed_by: seen.append(
+                assessed_by
             ),
         )
-        processor = make_processor()
+        risk_analyzer = RiskAnalyzer(clock=lambda: DAY_TIME)
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, clock=lambda: DAY_TIME
+        )
         tx = Transaction(
             type=TransactionType.WITHDRAWAL,
             amount=Decimal("10"),
@@ -763,20 +734,20 @@ class TestBankHookSuppression:
         )
         processor.process(tx)
         assert tx.status.value == "completed"
-        assert calls["n"] == 0
+        assert seen == [risk_analyzer]
 
         account.withdraw(Decimal("5"))
-        assert calls["n"] == 1
+        assert seen == [risk_analyzer, None]
 
-    def test_hook_restored_even_when_withdraw_fails(
+    def test_token_reset_even_when_processor_driven_withdraw_fails(
         self, account: BankAccount
     ):
-        calls = {"n": 0}
+        seen = []
         account._bind_bank_hooks(
             before_operation=lambda: None,
             after_withdraw=lambda amount: None,
-            before_withdraw=lambda amount: calls.__setitem__(
-                "n", calls["n"] + 1
+            before_withdraw=lambda amount, assessed_by: seen.append(
+                assessed_by
             ),
         )
         processor = make_processor()
@@ -787,11 +758,93 @@ class TestBankHookSuppression:
         )
         processor.process(tx)
         assert tx.status.value == "failed"
-        assert calls["n"] == 0
 
         with pytest.raises(InsufficientFundsError):
             account.withdraw(Decimal("1000"))
-        assert calls["n"] == 1
+        # both calls reached the hook; the second (direct) one carries
+        # no assessed_by token, proving it was not left over from the
+        # first (processor-driven) call after that call raised
+        assert seen[-1] is None
+
+    def test_shared_risk_analyzer_is_assessed_only_once(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        # When the sender account was opened through a Bank whose
+        # risk_analyzer is the SAME instance the processor uses (the
+        # configuration demos/day6_demo.py and day7_demo.py wire up),
+        # one processed transaction must record exactly one operation
+        # in the analyzer's frequency history - not two.
+        risk_analyzer = RiskAnalyzer(clock=lambda: DAY_TIME)
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=risk_analyzer
+        )
+        client = bank.add_client(
+            full_name="Anna",
+            birth_date=date(1990, 1, 1),
+            phone="+79990000001",
+            password="secret123",
+        )
+        acc = bank.open_account(
+            client.client_id, initial_balance=Decimal("1000")
+        )
+        other = bank.open_account(
+            client.client_id, initial_balance=Decimal("0")
+        )
+        processor = TransactionProcessor(
+            risk_analyzer=risk_analyzer, clock=lambda: DAY_TIME
+        )
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("10"),
+            sender=acc,
+            receiver=other,
+        )
+        processor.process(tx)
+        assert tx.status.value == "completed"
+        assert len(risk_analyzer._recent_operations[acc.account_id]) == 1
+
+    def test_different_processor_analyzer_cannot_bypass_bank_policy(
+        self, account: BankAccount, other_account: BankAccount
+    ):
+        # Regression test: a processor configured with a different (or
+        # default) risk_analyzer than the bank's must NOT silently
+        # skip the bank's own, stricter policy. Direct withdrawal of
+        # 60 is blocked by the bank's strict thresholds; a transfer of
+        # the same amount through an independently-configured
+        # processor must be blocked too, not silently let through.
+        strict_analyzer = RiskAnalyzer(
+            large_amount_threshold=Decimal("50"),
+            frequent_operations_threshold=1,
+            clock=lambda: DAY_TIME,
+        )
+        bank = Bank(
+            name="X", clock=lambda: DAY_TIME, risk_analyzer=strict_analyzer
+        )
+        client = bank.add_client(
+            full_name="Anna",
+            birth_date=date(1990, 1, 1),
+            phone="+79990000001",
+            password="secret123",
+        )
+        acc = bank.open_account(
+            client.client_id, initial_balance=Decimal("1000")
+        )
+        other = bank.open_account(
+            client.client_id, initial_balance=Decimal("0")
+        )
+
+        processor = TransactionProcessor(clock=lambda: DAY_TIME)
+        tx = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=Decimal("60"),
+            sender=acc,
+            receiver=other,
+        )
+        processor.process(tx)
+        assert tx.status.value == "failed"
+        assert "blocked by risk analysis" in tx.failure_reason
+        assert acc.balance == Decimal("1000")
+        assert other.balance == Decimal("0")
 
 
 class TestAuditLogIntegration:
